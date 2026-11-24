@@ -29,7 +29,8 @@ const W_AUDIO: f32 = 88.;
 const W_CONTAINER: f32 = 92.;
 const W_DESTINATION: f32 = 132.;
 const W_PROGRESS: f32 = 88.;
-const W_SIZE: f32 = 56.;
+/// 「444.9 KB」と「/ 444.9 KB」を2行で折り返さずに表示できる幅。
+const W_SIZE: f32 = 76.;
 const W_ACTIONS: f32 = 212.;
 const TABLE_WIDTH: f32 = W_STATUS
     + W_URL
@@ -1031,12 +1032,14 @@ fn size_cell(item: &QueueItem, cx: &App) -> AnyElement {
         .gap_0p5()
         .child(
             div()
+                .whitespace_nowrap()
                 .text_xs()
                 .text_color(cx.theme().foreground)
                 .child(item.downloaded().clone()),
         )
         .child(
             div()
+                .whitespace_nowrap()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(format!("/ {}", item.total())),
