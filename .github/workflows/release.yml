@@ -26,6 +26,9 @@ env:
   APP_NAME: 'Tree Movie Downloader'
   BIN_NAME: tree-movie-downloader
   BUNDLE_ID: com.treetips.tree-movie-downloader
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: 'true'
+  CARGO_BUILD_JOBS: '4'
 
 jobs:
   release:
@@ -52,6 +55,15 @@ jobs:
         run: |
           rustc --version
           cargo --version
+
+      - name: Setup sccache
+        uses: mozilla/sccache-action@v0.0.7
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+          cache-on-failure: true
 
       # ------------------------------------------------------------
       # バージョン算出

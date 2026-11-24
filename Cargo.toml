@@ -24,3 +24,9 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[profile.release]
+# ビルド時間とバイナリサイズのバランスを取る。
+lto = "thin"
+codegen-units = 16
+strip = "symbols"
