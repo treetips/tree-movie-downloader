@@ -55,7 +55,3 @@
 - 説明: `yt-dlp と ffmpeg を GitHub Releases からダウンロードします。初回起動時のみで、次回からは再ダウンロードしません。`
 - 補足: `準備が完了すると自動的にメイン画面へ進みます。`
 - 再試行: `再試行`
-
-## 参考
-
-- [外部ツールを GitHub Releases から起動時にダウンロードする](../../adr/0001-1000/0018-download-tools-from-releases.md)
