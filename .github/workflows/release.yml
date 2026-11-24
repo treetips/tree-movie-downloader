@@ -57,7 +57,7 @@ jobs:
           cargo --version
 
       - name: Setup sccache
-        uses: mozilla/sccache-action@v0.0.7
+        uses: Mozilla-Actions/sccache-action@v0.0.7
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
