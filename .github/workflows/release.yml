@@ -1,0 +1,281 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'バージョンアップの種類'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  REPO_URL: https://github.com/treetips/tree-movie-downloader
+  MACOSX_DEPLOYMENT_TARGET: '13.0'
+  APP_NAME: 'Tree Movie Downloader'
+  BIN_NAME: tree-movie-downloader
+  BUNDLE_ID: com.treetips.tree-movie-downloader
+
+jobs:
+  release:
+    name: Build & Create Release
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure release runs from main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Release は main ブランチから実行してください。"
+          exit 1
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Show Rust version
+        run: |
+          rustc --version
+          cargo --version
+
+      # ------------------------------------------------------------
+      # バージョン算出
+      # 最新の v* タグと bump 指定から次のバージョンを決める。
+      # Cargo.toml は開発用のバージョンのままにし、リリースビルド
+      # だけ TMD_APP_VERSION で表示バージョンを差し替える。
+      # ------------------------------------------------------------
+      - name: Compute version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST_TAG="$(git tag --list 'v*' --sort=v:refname | tail -n1 || true)"
+          if [[ -n "$LATEST_TAG" ]]; then
+            CURRENT="${LATEST_TAG#v}"
+          else
+            CURRENT="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
+          if ! [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Current version is not semver: $CURRENT"
+            exit 1
+          fi
+
+          if [[ -z "$LATEST_TAG" ]]; then
+            # 初回リリースは Cargo.toml のバージョンをそのまま使う。
+            NEW_VERSION="$CURRENT"
+          else
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "${{ inputs.bump }}" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+            esac
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          fi
+          TAG_NAME="v${NEW_VERSION}"
+          echo "Base tag:  ${LATEST_TAG:-none}"
+          echo "Version:   $NEW_VERSION"
+          echo "Tag:       $TAG_NAME"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag already exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          if git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists. Choose another bump type."
+            exit 1
+          fi
+
+      # アプリは初回起動時に tools-latest から外部ツールを取得する。
+      # 配布物が無いままアプリをリリースすると初回起動できないため、
+      # 先に Release Tools ワークフローを実行しておく。
+      - name: Verify tools release exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$REPO_URL/releases/download/tools-latest/tools-info.json"
+          if ! curl -fsSL --retry 3 --connect-timeout 10 -o /dev/null "$URL"; then
+            echo "::error::tools-latest の tools-info.json を取得できません。先に Release Tools ワークフローを実行してください。"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release
+        env:
+          TMD_APP_VERSION: ${{ steps.version.outputs.version }}
+        run: cargo build --release --locked
+
+      # ------------------------------------------------------------
+      # .app の組み立て
+      # ------------------------------------------------------------
+      - name: Package application
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          export COPYFILE_DISABLE=1
+          VERSION="${{ steps.version.outputs.version }}"
+          APP="$RUNNER_TEMP/${APP_NAME}.app"
+          DIST="$GITHUB_WORKSPACE/dist-release"
+          rm -rf "$APP" "$DIST"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$DIST"
+
+          BIN="target/release/${BIN_NAME}"
+          if [[ ! -x "$BIN" ]]; then
+            echo "::error::Release binary not found: $BIN"
+            exit 1
+          fi
+          cp "$BIN" "$APP/Contents/MacOS/${BIN_NAME}"
+
+          # サンプルサウンドや背景画像を .app から読めるように同梱する。
+          cp -R assets "$APP/Contents/Resources/assets"
+          find "$APP/Contents/Resources" -name '.DS_Store' -delete
+          cp LICENSE "$APP/Contents/Resources/LICENSE"
+          cp THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
+
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>ja</string>
+            <key>CFBundleDisplayName</key>
+            <string>${APP_NAME}</string>
+            <key>CFBundleExecutable</key>
+            <string>${BIN_NAME}</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>CFBundleIdentifier</key>
+            <string>${BUNDLE_ID}</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>${APP_NAME}</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>LSApplicationCategoryType</key>
+            <string>public.app-category.video</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>13.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>NSHumanReadableCopyright</key>
+            <string>Copyright @2026 treetips555</string>
+            <key>NSPrincipalClass</key>
+            <string>NSApplication</string>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$APP/Contents/Info.plist"
+
+          # PNG から .icns を生成する。画像は正方形ではないため、
+          # ImageMagick があれば透明背景で正方形に収める。無い場合は
+          # sips で引き伸ばす（アイコン用途では許容する）。
+          ICON_1024="$RUNNER_TEMP/AppIcon-1024.png"
+          if command -v magick >/dev/null 2>&1; then
+            magick "assets/images/icon-tree-01.png" \
+              -resize 1024x1024 -background none -gravity center -extent 1024x1024 \
+              "$ICON_1024"
+          else
+            sips -z 1024 1024 "assets/images/icon-tree-01.png" --out "$ICON_1024" >/dev/null
+          fi
+
+          ICONSET="$RUNNER_TEMP/AppIcon.iconset"
+          rm -rf "$ICONSET"
+          mkdir -p "$ICONSET"
+          for spec in \
+            "16 icon_16x16" "32 icon_16x16@2x" \
+            "32 icon_32x32" "64 icon_32x32@2x" \
+            "128 icon_128x128" "256 icon_128x128@2x" \
+            "256 icon_256x256" "512 icon_256x256@2x" \
+            "512 icon_512x512" "1024 icon_512x512@2x"
+          do
+            SIZE="${spec%% *}"
+            NAME="${spec#* }"
+            sips -z "$SIZE" "$SIZE" "$ICON_1024" \
+              --out "$ICONSET/${NAME}.png" >/dev/null
+          done
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+
+          # 署名（Developer ID 未取得のため ad-hoc）。
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+          ZIP_NAME="Tree-Movie-Downloader-v${VERSION}-macos.zip"
+          ditto -c -k --keepParent --norsrc --noextattr "$APP" "$DIST/$ZIP_NAME"
+          cp LICENSE "$DIST/LICENSE"
+          cp THIRD_PARTY_NOTICES.md "$DIST/THIRD_PARTY_NOTICES.md"
+
+          ZIP_SHA256="$(cd "$DIST" && shasum -a 256 "$ZIP_NAME" | awk '{print $1}')"
+          cat > "$DIST/update-info.json" <<EOF
+          {
+            "version": "${VERSION}",
+            "url": "${REPO_URL}/releases/download/v${VERSION}/${ZIP_NAME}",
+            "sha256": "${ZIP_SHA256}"
+          }
+          EOF
+
+          (
+            cd "$DIST"
+            shasum -a 256 "$ZIP_NAME" update-info.json LICENSE THIRD_PARTY_NOTICES.md \
+              > SHA256SUMS.txt
+          )
+
+          echo "Created: $DIST/$ZIP_NAME"
+          cat "$DIST/update-info.json"
+          cat "$DIST/SHA256SUMS.txt"
+          echo "zip_path=$DIST/$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=$DIST/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
+          echo "update_info_path=$DIST/update-info.json" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push Git tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          gh release create "$TAG" \
+            "${{ steps.package.outputs.zip_path }}" \
+            "${{ steps.package.outputs.checksum_path }}" \
+            "${{ steps.package.outputs.update_info_path }}" \
+            "dist-release/LICENSE" \
+            "dist-release/THIRD_PARTY_NOTICES.md" \
+            --title "Tree Movie Downloader v${VERSION}" \
+            --generate-notes

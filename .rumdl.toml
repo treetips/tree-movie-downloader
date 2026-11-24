@@ -1,0 +1,83 @@
+# rumdl configuration file
+
+# Inherit settings from another config file (relative to this file's directory)
+# extends = "../base.rumdl.toml"
+
+# Global configuration options
+[global]
+# List of rules to disable (uncomment and modify as needed)
+disable = ["MD013", "MD033"]
+
+# List of rules to enable exclusively (replaces defaults; only these rules will run)
+# enable = ["MD001", "MD003", "MD004"]
+
+# Additional rules to enable on top of defaults (additive, does not replace)
+# Use this to activate opt-in rules like MD060, MD063, MD072, MD073, MD074
+# MD060（表の桁揃え）は既定で無効なopt-inルールなので明示的に有効化する。
+# Why not enable か: 既定のルール群を維持したまま表の整形だけを足したいため。
+extend-enable = ["MD060"]
+
+# Additional rules to disable on top of the disable list (additive)
+# extend-disable = ["MD041"]
+
+# List of file/directory patterns to include for linting (if provided, only these will be linted)
+# 自前で管理するMarkdownをすべて対象にする（同梱スキルの文書は対象外）。
+include = [
+   "**/*.md"
+]
+
+# List of file/directory patterns to exclude from linting
+exclude = [
+    # Common directories to exclude
+    ".git",
+    ".github",
+    # 同梱しているスキルの文書は外部由来のため対象外にする。
+    ".opencode",
+    # 同梱ツールに付属する文書（upscayl/custom-models 由来）は外部由来のため対象外にする。
+    "tools",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+
+    # Specific files or patterns
+    "CHANGELOG.md",
+    "LICENSE.md",
+]
+
+# Respect .gitignore, .ignore and git exclude files when scanning directories
+# (default: true). .markdownlintignore applies regardless.
+respect-gitignore = true
+
+# Markdown flavor/dialect (uncomment to enable)
+# Options: standard (default), gfm, commonmark, mkdocs, mdx, pandoc, quarto, obsidian, kramdown, azure_devops, myst, hugo, mdg, gh-aw
+flavor = "gfm"
+
+# Rule-specific configurations (uncomment and modify as needed)
+
+# [MD003]
+# style = "atx"  # Heading style (atx, atx_closed, setext)
+
+# [MD004]
+# style = "asterisk"  # Unordered list style (asterisk, plus, dash, consistent)
+
+# [MD007]
+# indent = 4  # Unordered list indentation
+
+# [MD013]
+# line-length = 100  # Line length
+# code-blocks = false  # Exclude code blocks from line length check
+# tables = false  # Exclude tables from line length check
+# headings = true  # Include headings in line length check
+
+# [MD044]
+# names = ["rumdl", "Markdown", "GitHub"]  # Proper names that should be capitalized correctly
+# code-blocks = false  # Check code blocks for proper names (default: false, skips code blocks)
+
+[MD060]
+# 表の桁を揃える。既定の "any" は既存の書式を尊重するだけで、崩れた表を整形しない。
+# Why not "compact" か: 日本語の表はセル幅が広く、空白を詰めると列の境界が読みにくいため。
+style = "aligned"
+# MD013 を無効にしているので max-width は無限（自動で compact に落ちない）。
+# 日本語の表が途中で compact になり列幅が揃わなくなるのを避ける。
+max-width = 0

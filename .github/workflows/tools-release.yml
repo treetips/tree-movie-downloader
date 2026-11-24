@@ -1,0 +1,59 @@
+name: Release Tools
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '配布先のリリースタグ（アプリ本体とは独立）'
+        required: true
+        default: 'tools-latest'
+      yt_dlp_version:
+        description: 'yt-dlp のバージョン（空なら最新）'
+        required: false
+        default: ''
+      ffmpeg_static_tag:
+        description: 'eugeneware/ffmpeg-static のタグ（空なら最新）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Build & Publish Tools
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build tool assets
+        env:
+          TAG: ${{ inputs.tag }}
+          REPO_URL: https://github.com/${{ github.repository }}
+          YT_DLP_VERSION: ${{ inputs.yt_dlp_version }}
+          FFMPEG_STATIC_TAG: ${{ inputs.ffmpeg_static_tag }}
+        run: |
+          set -euo pipefail
+          chmod +x tools/build-release-assets.sh
+          tools/build-release-assets.sh dist-tools
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; replacing assets."
+          else
+            gh release create "$TAG" \
+              --title "Tools" \
+              --notes "yt-dlp と ffmpeg の配布物です。アプリが起動時に取得します。" \
+              --prerelease
+          fi
+          # ツール配布用リリースが GitHub の「Latest」になり、アプリ本体の
+          # 更新確認（releases/latest）を隠さないように prerelease を維持する。
+          gh release edit "$TAG" --prerelease
+          gh release upload "$TAG" dist-tools/* --clobber

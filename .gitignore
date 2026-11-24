@@ -1,0 +1,10 @@
+# skillsはgit管理しない
+.agents/skills
+.dsh/*
+
+# ビルド成果物
+/target
+/dist-tools
+/dist-release
+.DS_Store
+.rumdl_cache/

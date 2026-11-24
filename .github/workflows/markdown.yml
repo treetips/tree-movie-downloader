@@ -1,0 +1,37 @@
+name: Markdown
+
+# 全ブランチのpushで毎回実行する。PRのブランチへの追加pushもこのpushイベントで
+# 検査されるので、PR経由の検査も同じ実行が担う。
+# Why not pushとpull_requestを併用するか: 同一リポジトリ内のブランチでは両方が起動し、
+# 同じ検査が1コミットに2回動く（実行もChecks一覧も二重になる）。このプロジェクトは
+# 個人開発でforkからのPRを想定しないためpushに一本化する。PRのFiles changedタブへの
+# アノテーション表示は、PRのheadコミットに対するcheck runであれば維持される。
+# Why not pull_requestに一本化するか: PRの無いブランチのpushで検査が動かず、
+# どのブランチでも違反が無いことを常に確認できなくなる。
+# 変更ファイルで絞らないのは、Markdown以外の変更でも検査を素通りさせず、
+# どのブランチでも違反が残らないことを常に確認するため（実行は数秒で終わる）。
+on: push
+
+jobs:
+  check:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # バージョンを固定してローカルとCIで検査結果が変わらないようにする。
+      # PRのFiles changedタブに違反箇所をアノテーション表示する。
+      - name: Lint Markdown
+        uses: rvben/rumdl@v0
+        with:
+          version: '0.3.2'
+          report-type: annotations
+
+      # フォーマット崩れ（`rumdl fmt` で変わる差分の有無）も検査する。
+      - name: Check formatting
+        uses: rvben/rumdl@v0
+        with:
+          version: '0.3.2'
+          command: fmt-check
