@@ -218,11 +218,17 @@ impl AppView {
 
     /// 待機中・一時停止の項目をすべて開始する。
     fn start_pending(&mut self, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
         self.downloads
             .update(cx, |manager, cx| manager.start_pending_sites(cx));
     }
 
     fn retry_failed(&mut self, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
         self.queue.update(cx, |model, cx| {
             if model.retry_failed() > 0 {
                 cx.emit(QueueEvent::Changed);
@@ -232,6 +238,10 @@ impl AppView {
     }
 
     fn open_add_urls_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running {
+            window.push_notification(Notification::warning("実行中はURLを追加できません"), cx);
+            return;
+        }
         self.url_input
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.add_quality.update(cx, |state, cx| {
@@ -334,7 +344,7 @@ impl AppView {
                                         .text_xs()
                                         .text_color(dialog_cx.theme().muted_foreground)
                                         .child(
-                                            "1行に1件ずつ貼り付けてください。動画・チャンネル・プレイリストのURLに対応します。動画URLに list= が付いている場合は、その動画だけをダウンロードします。",
+                                            "http:// または https:// で始まるURLを1行に1件ずつ貼り付けてください。動画・チャンネル・プレイリストに対応します。これらで始まらない行は追加しません。動画URLに list= が付いている場合は、その動画だけをダウンロードします。",
                                         ),
                                 )
                                 .child(
@@ -366,7 +376,7 @@ impl AppView {
                                     if value.trim().is_empty() {
                                         window.push_notification(
                                             Notification::warning(
-                                                "URLを1行に1件入力してください",
+                                                "http:// または https:// で始まるURLを1行に1件入力してください",
                                             ),
                                             cx,
                                         );
@@ -427,7 +437,7 @@ impl AppView {
                                     if added == 0 {
                                         window.push_notification(
                                             Notification::warning(
-                                                "URLを1行に1件入力してください",
+                                                "http:// または https:// で始まるURLを1行に1件入力してください",
                                             ),
                                             cx,
                                         );
@@ -500,6 +510,9 @@ impl AppView {
     }
 
     fn open_clear_queue_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
         let model = self.queue.clone();
 
         window.open_alert_dialog(cx, move |alert, _, dialog_cx| {
@@ -542,6 +555,7 @@ impl AppView {
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
+            .bg(cx.theme().group_box)
             .child(self.nav_button(
                 "nav-batch",
                 Page::Batch,
@@ -873,27 +887,13 @@ impl AppView {
                 }))
                 .into_any_element(),
             UpdateState::UpToDate => div().into_any_element(),
-            UpdateState::Available(info) => h_flex()
-                .id("update-area-available")
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .bg(cx.theme().primary.opacity(0.12))
-                .cursor_pointer()
-                .child(
-                    Icon::new(IconName::Download)
-                        .xsmall()
-                        .text_color(cx.theme().primary),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(cx.theme().primary)
-                        .child("アップデートが有ります"),
-                )
+            UpdateState::Available(info) => Button::new("update-area-available")
+                .info()
+                .small()
+                .icon(IconName::Download)
+                .label("アップデートが有ります")
+                .bg(cx.theme().blue)
+                .text_color(cx.theme().background)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     let info = info.clone();
                     this.update_controller.update(cx, |controller, cx| {
@@ -1168,13 +1168,28 @@ impl AppView {
         )
     }
 
+    fn can_add_urls(running: bool) -> bool {
+        !running
+    }
+
+    fn can_clear_queue(running: bool, empty: bool) -> bool {
+        !running && !empty
+    }
+
+    fn can_start_queue(running: bool, has_pending: bool) -> bool {
+        !running && has_pending
+    }
+
     fn render_toolbar(
         &self,
         total: usize,
         empty: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let can_start = self.queue.read(cx).has_pending();
+        let running = self.running;
+        let can_add = Self::can_add_urls(running);
+        let can_clear = Self::can_clear_queue(running, empty);
+        let can_start = Self::can_start_queue(running, self.queue.read(cx).has_pending());
 
         h_flex()
             .h_12()
@@ -1187,28 +1202,40 @@ impl AppView {
                 Button::new("add-urls")
                     .icon(IconName::Plus)
                     .label("URLを追加…")
-                    .tooltip("URLを追加（⌘N）")
+                    .tooltip(if running {
+                        "実行中はURLを追加できません"
+                    } else {
+                        "URLを追加（⌘N）"
+                    })
+                    .disabled(!can_add)
+                    .when(can_add, |this| this.secondary().large().font_semibold())
                     .on_click(
                         cx.listener(|this, _, window, cx| this.open_add_urls_dialog(window, cx)),
                     ),
             )
             .child(
                 Button::new("start-queue")
-                    .icon(Icon::new(IconName::Play).text_color(if can_start {
-                        cx.theme().success
-                    } else {
-                        cx.theme().muted_foreground
-                    }))
+                    .icon(IconName::Play)
                     .label("開始する")
-                    .tooltip("待機中のキューを開始")
+                    .tooltip(if running {
+                        "実行中は開始できません"
+                    } else {
+                        "待機中のキューを開始"
+                    })
                     .disabled(!can_start)
+                    .when(can_start, |this| this.primary().large().font_semibold())
                     .on_click(cx.listener(|this, _, _, cx| this.start_pending(cx))),
             )
             .child(
                 Button::new("clear-queue")
                     .icon(IconName::ListX)
                     .label("キューを空にする")
-                    .disabled(empty)
+                    .tooltip(if running {
+                        "実行中はキューを空にできません"
+                    } else {
+                        "キューを空にする"
+                    })
+                    .disabled(!can_clear)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.open_clear_queue_dialog(window, cx)),
                     ),
@@ -1243,7 +1270,7 @@ impl AppView {
         let content: AnyElement = if total == 0 {
             render_empty_queue(cx).into_any_element()
         } else {
-            render_queue(&self.queue, &self.downloads, cx)
+            render_queue(&self.queue, &self.downloads, self.running, cx)
         };
 
         v_flex()
@@ -1263,16 +1290,12 @@ impl AppView {
                             .text_color(cx.theme().muted_foreground)
                             .child(format!("{completed}/{total} 完了")),
                     )
-                    .when(!finished, |this| this.child(div().flex_1()))
                     .child(
-                        div()
-                            .when(finished, |this| this.flex_1().min_w_0())
-                            .when(!finished, |this| this.w(px(120.)))
-                            .child(
-                                gpui_kit::component::progress::Progress::new("queue-overall")
-                                    .value(overall)
-                                    .small(),
-                            ),
+                        div().flex_1().min_w_0().child(
+                            gpui_kit::component::progress::Progress::new("queue-overall")
+                                .value(overall)
+                                .small(),
+                        ),
                     )
                     .child(
                         div()
@@ -1583,5 +1606,26 @@ impl Render for AppView {
                     cx,
                 ))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppView;
+
+    #[test]
+    fn toolbar_actions_respect_running_and_queue_state() {
+        assert!(AppView::can_add_urls(false));
+        assert!(!AppView::can_add_urls(true));
+
+        assert!(AppView::can_clear_queue(false, false));
+        assert!(!AppView::can_clear_queue(false, true));
+        assert!(!AppView::can_clear_queue(true, false));
+        assert!(!AppView::can_clear_queue(true, true));
+
+        assert!(AppView::can_start_queue(false, true));
+        assert!(!AppView::can_start_queue(true, true));
+        assert!(!AppView::can_start_queue(false, false));
+        assert!(!AppView::can_start_queue(true, false));
     }
 }

@@ -335,6 +335,7 @@ pub struct QueueItem {
     container: Container,
     attempts: usize,
     error: Option<SharedString>,
+    output_path: Option<SharedString>,
 }
 
 impl QueueItem {
@@ -363,6 +364,7 @@ impl QueueItem {
             container: container.for_quality(quality),
             attempts: 0,
             error: None,
+            output_path: None,
         }
     }
 
@@ -442,6 +444,14 @@ impl QueueItem {
 
     pub fn error(&self) -> Option<&SharedString> {
         self.error.as_ref()
+    }
+
+    pub fn output_path(&self) -> Option<&str> {
+        if matches!(self.status, ItemStatus::Completed | ItemStatus::Skipped) {
+            self.output_path.as_deref()
+        } else {
+            None
+        }
     }
 }
 
@@ -994,6 +1004,8 @@ impl QueueModel {
     }
 
     /// 画質と音質を指定してURLを追加する。コンテナは共通設定の値を使う。
+    ///
+    /// `http://` または `https://` で始まる行だけを追加する。
     pub fn add_urls_with(
         &mut self,
         text: &str,
@@ -1005,7 +1017,11 @@ impl QueueModel {
         let urls: Vec<&str> = text
             .lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty())
+            .filter(|line| {
+                line.split_once("://").is_some_and(|(scheme, _)| {
+                    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+                })
+            })
             .collect();
         let container = container.for_quality(quality);
         let destination = if destination.trim().is_empty() {
@@ -1086,7 +1102,7 @@ impl QueueModel {
         }
     }
 
-    pub fn complete_item(&mut self, id: u64, path: &str) {
+    pub fn complete_item(&mut self, id: u64, path: Option<&str>) {
         if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
             item.status = ItemStatus::Completed;
             item.progress = 100.0;
@@ -1097,9 +1113,11 @@ impl QueueModel {
                 item.downloaded = item.total.clone();
             }
             item.error = None;
+            item.output_path = path.map(Into::into);
             let site = item.site;
             let url = compact_url(&item.url);
             item.downloaded = item.downloaded.clone();
+            let path = path.unwrap_or("（出力先はyt-dlpのログを確認してください）");
             self.push_log_for_site(
                 site,
                 LogLevel::Info,
@@ -1141,12 +1159,15 @@ impl QueueModel {
     }
 
     pub fn retry(&mut self, id: u64) {
-        let url = if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+        let url = if let Some(item) = self.items.iter_mut().find(|item| item.id == id)
+            && item.status == ItemStatus::Failed
+        {
             let site = item.site;
             item.status = ItemStatus::Queued;
             item.progress = 0.0;
             item.attempts = 0;
             item.error = None;
+            item.output_path = None;
             item.downloaded = "—".into();
             item.total = "—".into();
             Some((site, compact_url(&item.url)))
@@ -1170,6 +1191,7 @@ impl QueueModel {
                 item.progress = 0.0;
                 item.attempts = 0;
                 item.error = None;
+                item.output_path = None;
                 item.downloaded = "—".into();
                 item.total = "—".into();
                 retried += 1;
@@ -1192,6 +1214,7 @@ impl QueueModel {
                 item.progress = 0.0;
                 item.attempts = 0;
                 item.error = None;
+                item.output_path = None;
                 item.downloaded = "—".into();
                 item.total = "—".into();
                 retried += 1;
@@ -1254,19 +1277,6 @@ impl QueueModel {
         before - self.items.len()
     }
 
-    pub fn skip(&mut self, id: u64) {
-        let url = if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
-            let site = item.site;
-            item.status = ItemStatus::Skipped;
-            Some((site, compact_url(&item.url)))
-        } else {
-            None
-        };
-        if let Some((site, url)) = url {
-            self.push_log_for_site(site, LogLevel::Info, format!("[{url}] をスキップしました"));
-        }
-    }
-
     /// 保存先に同じIDのダウンロード済みファイルがある項目を、取得せずスキップ済みにする。
     pub fn skip_already_downloaded(&mut self, id: u64, path: &str) {
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
@@ -1276,6 +1286,7 @@ impl QueueModel {
         item.progress = 0.0;
         item.eta = None;
         item.error = None;
+        item.output_path = Some(path.into());
         item.downloaded = "—".into();
         item.total = "—".into();
         let site = item.site;
@@ -1320,6 +1331,44 @@ mod tests {
         assert!(model.active_item().is_none());
         assert_eq!(model.destinations().len(), 1);
         assert_eq!(model.destinations()[0], default_downloads_dir());
+    }
+
+    #[test]
+    fn completed_items_keep_their_output_path() {
+        let mut model = QueueModel::new();
+        model.add_urls_with(
+            "https://example.com/video",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+        let id = model.items().last().unwrap().id();
+
+        model.complete_item(id, Some("/tmp/video.mp4"));
+
+        let item = model.items().last().unwrap();
+        assert_eq!(item.status(), ItemStatus::Completed);
+        assert_eq!(item.output_path(), Some("/tmp/video.mp4"));
+
+        model.retry(id);
+
+        let item = model.items().last().unwrap();
+        assert_eq!(item.status(), ItemStatus::Completed);
+        assert_eq!(item.output_path(), Some("/tmp/video.mp4"));
+
+        model.fail_item(id, "failed");
+        model.retry(id);
+
+        let item = model.items().last().unwrap();
+        assert_eq!(item.status(), ItemStatus::Queued);
+        assert_eq!(item.output_path(), None);
+
+        model.complete_item(id, None);
+
+        let item = model.items().last().unwrap();
+        assert_eq!(item.status(), ItemStatus::Completed);
+        assert_eq!(item.output_path(), None);
     }
 
     #[test]
@@ -1385,6 +1434,54 @@ mod tests {
         assert_eq!(added_item.quality(), DEFAULT_QUALITY);
         assert_eq!(added_item.audio(), DEFAULT_AUDIO);
         assert_eq!(added_item.container(), DEFAULT_CONTAINER);
+    }
+
+    #[test]
+    fn add_urls_ignores_lines_without_an_http_scheme() {
+        let mut model = QueueModel::demo();
+        let before = model.items().len();
+
+        let added = model.add_urls_with(
+            "example.com/a\nftp://example.com/b\n  http://example.com/c  \r\n\nhttps://example.com/d\nHTTPS://example.com/e\nhttpsx://example.com/f\n",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+
+        assert_eq!(added, 3);
+        assert_eq!(model.items().len(), before + 3);
+        let added_urls: Vec<_> = model
+            .items()
+            .iter()
+            .skip(before)
+            .map(|item| item.url().to_string())
+            .collect();
+        assert_eq!(
+            added_urls,
+            vec![
+                "http://example.com/c",
+                "https://example.com/d",
+                "HTTPS://example.com/e"
+            ]
+        );
+    }
+
+    #[test]
+    fn add_urls_with_only_invalid_lines_adds_nothing() {
+        let mut model = QueueModel::demo();
+        let before = model.items().len();
+
+        let added = model.add_urls_with(
+            "example.com/a\nftp://example.com/b\njavascript:alert(1)\n",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+
+        assert_eq!(added, 0);
+        assert_eq!(model.items().len(), before);
     }
 
     #[test]
@@ -1701,6 +1798,10 @@ mod tests {
 
         let item = model.items().first().unwrap();
         assert_eq!(item.status(), ItemStatus::Skipped);
+        assert_eq!(
+            item.output_path(),
+            Some("/tmp/downloads/example [abc123].mp4")
+        );
         assert!(model.logs_for_site(Site::YouTube).iter().any(|entry| {
             entry
                 .message()

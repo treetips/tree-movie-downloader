@@ -20,6 +20,8 @@ use gpui_kit::*;
 
 use app::{AddUrls, AppView, CheckForUpdates, QuitApp, RetryFailed, StartOrPause};
 
+const ICON_PNG: &[u8] = include_bytes!("../assets/images/icon-tree-01.png");
+
 /// アプリのアセット。GPUI Kitのアイコンカタログに、アプリアイコンを追加する。
 struct AppAssets;
 
@@ -27,9 +29,7 @@ impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         match path {
             "images/icon-tree-01.png" => {
-                return Ok(Some(Cow::Borrowed(include_bytes!(
-                    "../assets/images/icon-tree-01.png"
-                ))));
+                return Ok(Some(Cow::Borrowed(ICON_PNG)));
             }
             "images/wallpaper/wallpaper1.jpg" => {
                 return Ok(Some(Cow::Borrowed(include_bytes!(
@@ -67,9 +67,44 @@ impl AssetSource for AppAssets {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AnyThread as _, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return;
+    };
+    let bytes = ICON_PNG;
+    // SAFETY: `bytes` is a static slice valid for `bytes.len()` bytes, and
+    // `initWithBytes:length:` copies that data into the retained `NSData`.
+    let data = unsafe {
+        NSData::initWithBytes_length(
+            NSData::alloc(),
+            bytes.as_ptr().cast::<std::ffi::c_void>(),
+            bytes.len(),
+        )
+    };
+    let Some(icon) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    let application = NSApplication::sharedApplication(main_thread);
+    // SAFETY: AppKit is accessed on the main thread with a valid retained image.
+    unsafe {
+        application.setApplicationIconImage(Some(&icon));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {}
+
 fn main() {
     gpui_kit::application().with_assets(AppAssets).run(|cx| {
         gpui_kit::init(cx);
+        if cfg!(debug_assertions) {
+            set_dock_icon();
+        }
 
         cx.on_action(|_: &CheckForUpdates, cx| {
             let Some(window) = cx.active_window() else {
