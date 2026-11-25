@@ -60,7 +60,7 @@ enum DownloadEvent {
     Completed {
         id: u64,
         url: String,
-        path: String,
+        path: Option<String>,
     },
     Failed {
         id: u64,
@@ -81,7 +81,7 @@ enum DownloadEvent {
 }
 
 enum RunOutcome {
-    Success(String),
+    Success(Option<String>),
     Failed(String),
     Cancelled,
 }
@@ -229,6 +229,7 @@ impl DownloadManager {
         cx.spawn(async move |_, cx| {
             let mut should_start_next = false;
             while let Ok(event) = rx.recv().await {
+                let feedback = terminal_feedback(&event);
                 match event {
                     DownloadEvent::Progress {
                         id,
@@ -249,23 +250,23 @@ impl DownloadManager {
                             cx.notify();
                         });
                     }
-                    DownloadEvent::Completed { id, url, path } => {
+                    DownloadEvent::Completed { id, path, .. } => {
                         queue.update(cx, |model, cx| {
-                            model.complete_item(id, &path);
+                            model.complete_item(id, path.as_deref());
                             cx.emit(QueueEvent::Changed);
                             cx.notify();
                         });
-                        notify_completion(true, &url);
+                        report_terminal_feedback(feedback);
                         should_start_next = true;
                         break;
                     }
-                    DownloadEvent::Failed { id, url, error } => {
+                    DownloadEvent::Failed { id, error, .. } => {
                         queue.update(cx, |model, cx| {
                             model.fail_item(id, error);
                             cx.emit(QueueEvent::Changed);
                             cx.notify();
                         });
-                        notify_completion(false, &url);
+                        report_terminal_feedback(feedback);
                         should_start_next = true;
                         break;
                     }
@@ -275,6 +276,7 @@ impl DownloadManager {
                             cx.emit(QueueEvent::Changed);
                             cx.notify();
                         });
+                        report_terminal_feedback(feedback);
                         should_start_next = true;
                         break;
                     }
@@ -623,12 +625,13 @@ fn run_once(
         .unwrap_or_default();
 
     match status {
-        Ok(status) if status.success() => RunOutcome::Success(
-            paths
-                .last()
-                .cloned()
-                .unwrap_or_else(|| "（出力先はyt-dlpのログを確認してください）".to_string()),
-        ),
+        Ok(status) if status.success() => {
+            let output_path = match paths.as_slice() {
+                [path] => Some(path.clone()),
+                _ => None,
+            };
+            RunOutcome::Success(output_path)
+        }
         Ok(status) => {
             if error_text.is_empty() {
                 RunOutcome::Failed(format!(
@@ -1022,15 +1025,40 @@ fn friendly_error(error: &str) -> String {
     }
 }
 
-fn notify_completion(success: bool, url: &str) {
+struct TerminalFeedback {
+    success: bool,
+    notification: Option<String>,
+}
+
+fn terminal_feedback(event: &DownloadEvent) -> Option<TerminalFeedback> {
+    match event {
+        DownloadEvent::Completed { url, .. } => Some(TerminalFeedback {
+            success: true,
+            notification: Some(format!("ダウンロード完了: {url}")),
+        }),
+        DownloadEvent::Failed { url, .. } => Some(TerminalFeedback {
+            success: false,
+            notification: Some(format!("ダウンロード失敗: {url}")),
+        }),
+        DownloadEvent::Skipped { .. } => Some(TerminalFeedback {
+            success: true,
+            notification: None,
+        }),
+        DownloadEvent::Progress { .. }
+        | DownloadEvent::Warning { .. }
+        | DownloadEvent::Cancelled { .. } => None,
+    }
+}
+
+fn report_terminal_feedback(feedback: Option<TerminalFeedback>) {
+    let Some(feedback) = feedback else {
+        return;
+    };
     let settings = AppSettings::load();
 
-    if settings.notify_on_complete {
-        let message = if success {
-            format!("ダウンロード完了: {url}")
-        } else {
-            format!("ダウンロード失敗: {url}")
-        };
+    if settings.notify_on_complete
+        && let Some(message) = feedback.notification
+    {
         let script = format!(
             "display notification \"{}\" with title \"Tree Movie Downloader\"",
             escape_applescript(&message)
@@ -1039,8 +1067,8 @@ fn notify_completion(success: bool, url: &str) {
     }
 
     if settings.play_sound {
-        let kind = if success { "success" } else { "error" };
-        let (selected, random) = if success {
+        let kind = if feedback.success { "success" } else { "error" };
+        let (selected, random) = if feedback.success {
             (settings.success_sound.as_deref(), settings.success_random)
         } else {
             (settings.error_sound.as_deref(), settings.error_random)
@@ -1091,6 +1119,69 @@ mod tests {
             cookies_from_browser: None,
             retries: 1,
         }
+    }
+
+    #[test]
+    fn skipped_items_use_success_completion_feedback() {
+        let feedback = terminal_feedback(&DownloadEvent::Skipped {
+            id: 1,
+            path: "/tmp/video.mp4".into(),
+        })
+        .expect("skipped items are terminal");
+
+        assert!(feedback.success);
+        assert_eq!(feedback.notification, None);
+    }
+
+    #[test]
+    fn completed_and_failed_items_keep_their_completion_feedback() {
+        let completed = terminal_feedback(&DownloadEvent::Completed {
+            id: 1,
+            url: "https://example.com/video".into(),
+            path: Some("/tmp/video.mp4".into()),
+        })
+        .expect("completed items are terminal");
+        assert!(completed.success);
+        assert_eq!(
+            completed.notification.as_deref(),
+            Some("ダウンロード完了: https://example.com/video")
+        );
+
+        let failed = terminal_feedback(&DownloadEvent::Failed {
+            id: 2,
+            url: "https://example.com/other".into(),
+            error: "failed".into(),
+        })
+        .expect("failed items are terminal");
+        assert!(!failed.success);
+        assert_eq!(
+            failed.notification.as_deref(),
+            Some("ダウンロード失敗: https://example.com/other")
+        );
+    }
+
+    #[test]
+    fn non_terminal_events_do_not_report_completion_feedback() {
+        let events = [
+            DownloadEvent::Progress {
+                id: 1,
+                percent: 50.0,
+                downloaded: "1 MB".into(),
+                total: "2 MB".into(),
+                eta: Some("10".into()),
+            },
+            DownloadEvent::Warning {
+                id: 1,
+                message: "warning".into(),
+            },
+            DownloadEvent::Cancelled { id: 1 },
+        ];
+
+        assert!(
+            events
+                .iter()
+                .all(|event| terminal_feedback(event).is_none())
+        );
     }
 
     #[test]

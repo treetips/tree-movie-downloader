@@ -1,6 +1,7 @@
 //! サイトごとに分かれたダウンロードキュー。
 
 use std::path::Path;
+use std::process::Command;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -46,6 +47,7 @@ const TABLE_WIDTH: f32 = W_STATUS
 pub fn render_queue(
     model: &Entity<QueueModel>,
     downloads: &Entity<DownloadManager>,
+    running: bool,
     cx: &mut App,
 ) -> AnyElement {
     let (items, destinations) = {
@@ -66,6 +68,7 @@ pub fn render_queue(
         sections.push(site_section(
             model.clone(),
             downloads.clone(),
+            running,
             site,
             site_items,
             &destinations,
@@ -84,6 +87,7 @@ pub fn render_queue(
 fn site_section(
     model: Entity<QueueModel>,
     downloads: Entity<DownloadManager>,
+    running: bool,
     site: Site,
     items: Vec<QueueItem>,
     destinations: &[String],
@@ -93,8 +97,8 @@ fn site_section(
         .iter()
         .filter(|item| item.status() == ItemStatus::Downloading)
         .count();
-    let running = active > 0;
-    let can_start = running
+    let site_running = active > 0;
+    let can_start = site_running
         || items
             .iter()
             .any(|item| matches!(item.status(), ItemStatus::Paused | ItemStatus::Queued));
@@ -145,7 +149,7 @@ fn site_section(
             Button::new(SharedString::from(format!("site-toggle-{}", site.label())))
                 .ghost()
                 .xsmall()
-                .icon(if running {
+                .icon(if site_running {
                     Icon::new(IconName::Pause)
                 } else {
                     Icon::new(IconName::Play).text_color(if can_start {
@@ -154,7 +158,11 @@ fn site_section(
                         cx.theme().muted_foreground
                     })
                 })
-                .label(if running { "一時停止" } else { "開始" })
+                .label(if site_running {
+                    "一時停止"
+                } else {
+                    "開始"
+                })
                 .disabled(!can_start)
                 .on_click(move |_, _, cx| {
                     toggle_downloads.update(cx, |manager, cx| {
@@ -168,8 +176,12 @@ fn site_section(
                 .xsmall()
                 .icon(IconName::RotateCcw)
                 .label("再試行")
-                .tooltip("このサイトの失敗した項目を再試行")
-                .disabled(!has_failed)
+                .tooltip(if running {
+                    "実行中は再試行できません"
+                } else {
+                    "このサイトの失敗した項目を再試行"
+                })
+                .disabled(!has_failed || running)
                 .on_click(move |_, _, cx| {
                     retry_model.update(cx, |model, cx| {
                         model.retry_failed_for_site(site);
@@ -217,7 +229,7 @@ fn site_section(
 
     let rows: Vec<AnyElement> = items
         .into_iter()
-        .map(|item| queue_row(model.clone(), item, destinations, cx))
+        .map(|item| queue_row(model.clone(), item, destinations, running, cx))
         .collect();
 
     let log_panel = v_flex()
@@ -389,6 +401,7 @@ fn queue_row(
     model: Entity<QueueModel>,
     item: QueueItem,
     destinations: &[String],
+    running: bool,
     cx: &mut App,
 ) -> AnyElement {
     let border = status_border_color(item.status(), cx);
@@ -422,7 +435,7 @@ fn queue_row(
         ))
         .child(cell(progress_cell(&item, cx), W_PROGRESS))
         .child(cell(size_cell(&item, cx), W_SIZE))
-        .child(cell(actions_cell(row_model, &item), W_ACTIONS))
+        .child(cell(actions_cell(row_model, &item, running), W_ACTIONS))
         .into_any_element()
 }
 
@@ -1047,59 +1060,89 @@ fn size_cell(item: &QueueItem, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn actions_cell(model: Entity<QueueModel>, item: &QueueItem) -> AnyElement {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ItemActions {
+    retry_visible: bool,
+    retry_enabled: bool,
+    remove_enabled: bool,
+    play_visible: bool,
+}
+
+impl ItemActions {
+    fn new(running: bool, status: ItemStatus) -> Self {
+        let retry_visible = status == ItemStatus::Failed;
+        Self {
+            retry_visible,
+            retry_enabled: !running && retry_visible,
+            remove_enabled: !running && status != ItemStatus::Downloading,
+            play_visible: matches!(status, ItemStatus::Completed | ItemStatus::Skipped),
+        }
+    }
+}
+
+fn open_output_file(path: &str) -> Result<(), String> {
+    let path = Path::new(path);
+    if !path.is_file() {
+        return Err("ファイルが見つかりません".to_string());
+    }
+
+    Command::new("/usr/bin/open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("ファイルを開けませんでした: {error}"))
+}
+
+fn actions_cell(model: Entity<QueueModel>, item: &QueueItem, running: bool) -> AnyElement {
     let retry_model = model.clone();
-    let skip_model = model.clone();
     let remove_model = model.clone();
     let retry_id = item.id();
-    let skip_id = item.id();
     let remove_id = item.id();
-    let can_retry = matches!(item.status(), ItemStatus::Failed | ItemStatus::Skipped);
-    let can_skip = !matches!(item.status(), ItemStatus::Completed | ItemStatus::Skipped);
+    let actions = ItemActions::new(running, item.status());
+    let play_path = if actions.play_visible {
+        item.output_path().map(str::to_string)
+    } else {
+        None
+    };
 
     h_flex()
         .w_full()
         .justify_end()
         .gap_1()
-        .child(
-            Button::new(("retry", retry_id))
-                .xsmall()
-                .icon(IconName::RotateCcw)
-                .label("再試行")
-                .tooltip("再試行")
-                .accessibility_label(format!("再試行: {}", compact_url(item.url())))
-                .disabled(!can_retry)
-                .on_click(move |_, _, cx| {
-                    retry_model.update(cx, |model, cx| {
-                        model.retry(retry_id);
-                        cx.emit(QueueEvent::Changed);
-                        cx.notify();
-                    });
-                }),
-        )
-        .child(
-            Button::new(("skip", skip_id))
-                .xsmall()
-                .icon(IconName::SkipForward)
-                .label("スキップ")
-                .tooltip("スキップ")
-                .accessibility_label(format!("スキップ: {}", compact_url(item.url())))
-                .disabled(!can_skip)
-                .on_click(move |_, _, cx| {
-                    skip_model.update(cx, |model, cx| {
-                        model.skip(skip_id);
-                        cx.emit(QueueEvent::Changed);
-                        cx.notify();
-                    });
-                }),
-        )
+        .when(actions.retry_visible, |this| {
+            this.child(
+                Button::new(("retry", retry_id))
+                    .xsmall()
+                    .icon(IconName::RotateCcw)
+                    .label("再試行")
+                    .tooltip(if running {
+                        "実行中は再試行できません"
+                    } else {
+                        "再試行"
+                    })
+                    .accessibility_label(format!("再試行: {}", compact_url(item.url())))
+                    .disabled(!actions.retry_enabled)
+                    .on_click(move |_, _, cx| {
+                        retry_model.update(cx, |model, cx| {
+                            model.retry(retry_id);
+                            cx.emit(QueueEvent::Changed);
+                            cx.notify();
+                        });
+                    }),
+            )
+        })
         .child(
             Button::new(("remove", remove_id))
                 .xsmall()
                 .icon(IconName::X)
                 .label("削除")
-                .tooltip("キューから削除")
+                .tooltip(if running {
+                    "実行中は削除できません"
+                } else {
+                    "キューから削除"
+                })
                 .accessibility_label(format!("キューから削除: {}", compact_url(item.url())))
+                .disabled(!actions.remove_enabled)
                 .on_click(move |_, _, cx| {
                     remove_model.update(cx, |model, cx| {
                         model.remove(remove_id);
@@ -1108,5 +1151,115 @@ fn actions_cell(model: Entity<QueueModel>, item: &QueueItem) -> AnyElement {
                     });
                 }),
         )
+        .when_some(play_path, |this, path| {
+            this.child(
+                Button::new(("play", item.id()))
+                    .xsmall()
+                    .icon(IconName::Play)
+                    .label("再生")
+                    .tooltip("既定のアプリで再生")
+                    .accessibility_label(format!("再生: {}", compact_url(item.url())))
+                    .on_click(move |_, window, cx| {
+                        if let Err(error) = open_output_file(&path) {
+                            window.push_notification(
+                                Notification::error(format!(
+                                    "ファイルを再生できませんでした: {error}"
+                                )),
+                                cx,
+                            );
+                        }
+                    }),
+            )
+        })
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ItemActions, ItemStatus, open_output_file};
+
+    #[test]
+    fn running_disables_queue_mutations_but_allows_completed_playback() {
+        for status in [
+            ItemStatus::Queued,
+            ItemStatus::Downloading,
+            ItemStatus::Paused,
+            ItemStatus::Completed,
+            ItemStatus::Failed,
+            ItemStatus::Skipped,
+        ] {
+            let actions = ItemActions::new(true, status);
+            assert_eq!(actions.retry_visible, status == ItemStatus::Failed);
+            assert!(!actions.retry_enabled);
+            assert!(!actions.remove_enabled);
+            assert_eq!(
+                actions.play_visible,
+                matches!(status, ItemStatus::Completed | ItemStatus::Skipped)
+            );
+        }
+    }
+
+    #[test]
+    fn stopped_row_actions_follow_item_status() {
+        assert_eq!(
+            ItemActions::new(false, ItemStatus::Failed),
+            ItemActions {
+                retry_visible: true,
+                retry_enabled: true,
+                remove_enabled: true,
+                play_visible: false,
+            }
+        );
+        assert_eq!(
+            ItemActions::new(false, ItemStatus::Skipped),
+            ItemActions {
+                retry_visible: false,
+                retry_enabled: false,
+                remove_enabled: true,
+                play_visible: true,
+            }
+        );
+        assert_eq!(
+            ItemActions::new(false, ItemStatus::Completed),
+            ItemActions {
+                retry_visible: false,
+                retry_enabled: false,
+                remove_enabled: true,
+                play_visible: true,
+            }
+        );
+        assert_eq!(
+            ItemActions::new(false, ItemStatus::Queued),
+            ItemActions {
+                retry_visible: false,
+                retry_enabled: false,
+                remove_enabled: true,
+                play_visible: false,
+            }
+        );
+        assert_eq!(
+            ItemActions::new(false, ItemStatus::Paused),
+            ItemActions {
+                retry_visible: false,
+                retry_enabled: false,
+                remove_enabled: true,
+                play_visible: false,
+            }
+        );
+        assert_eq!(
+            ItemActions::new(false, ItemStatus::Downloading),
+            ItemActions {
+                retry_visible: false,
+                retry_enabled: false,
+                remove_enabled: false,
+                play_visible: false,
+            }
+        );
+    }
+
+    #[test]
+    fn opening_a_missing_output_file_returns_an_error() {
+        let path = std::env::temp_dir().join(format!("tmd-missing-{}.mp4", std::process::id()));
+        assert!(open_output_file(path.to_str().unwrap()).is_err());
+    }
 }

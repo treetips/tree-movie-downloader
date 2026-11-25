@@ -19,6 +19,14 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 jxl-oxide = { version = "0.12.6", features = ["image"] }
 image = { version = "0.25", default-features = false }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
+    "NSImage",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"] }
+
 [profile.dev]
 opt-level = 1
 
