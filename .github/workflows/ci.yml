@@ -10,7 +10,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      - 'tools/**'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/tools-release.yml'
   pull_request:
     branches:
       - main
@@ -20,7 +22,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      - 'tools/**'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/tools-release.yml'
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -42,6 +46,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Check tools release shell syntax
+        run: |
+          for script in tools/*.sh; do
+            bash -n "$script"
+          done
+
+      - name: Test tools release workflow
+        run: bash tools/test-tools-release.sh
 
       # `rust-toolchain.toml` に固定したRustとcomponentsを導入する。
       - name: Install Rust toolchain

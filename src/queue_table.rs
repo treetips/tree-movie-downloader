@@ -43,11 +43,18 @@ const TABLE_WIDTH: f32 = W_STATUS
     + W_SIZE
     + W_ACTIONS;
 
+#[derive(Clone, Copy)]
+struct SiteControls {
+    running: bool,
+    updating: bool,
+}
+
 /// サイトごとのキュー表を組み立てる。
 pub fn render_queue(
     model: &Entity<QueueModel>,
     downloads: &Entity<DownloadManager>,
     running: bool,
+    updating: bool,
     cx: &mut App,
 ) -> AnyElement {
     let (items, destinations) = {
@@ -68,7 +75,7 @@ pub fn render_queue(
         sections.push(site_section(
             model.clone(),
             downloads.clone(),
-            running,
+            SiteControls { running, updating },
             site,
             site_items,
             &destinations,
@@ -84,24 +91,29 @@ pub fn render_queue(
         .into_any_element()
 }
 
+fn can_start_site(site_running: bool, has_startable: bool, updating: bool) -> bool {
+    !updating && (site_running || has_startable)
+}
+
 fn site_section(
     model: Entity<QueueModel>,
     downloads: Entity<DownloadManager>,
-    running: bool,
+    controls: SiteControls,
     site: Site,
     items: Vec<QueueItem>,
     destinations: &[String],
     cx: &mut App,
 ) -> AnyElement {
+    let SiteControls { running, updating } = controls;
     let active = items
         .iter()
         .filter(|item| item.status() == ItemStatus::Downloading)
         .count();
     let site_running = active > 0;
-    let can_start = site_running
-        || items
-            .iter()
-            .any(|item| matches!(item.status(), ItemStatus::Paused | ItemStatus::Queued));
+    let has_startable = items
+        .iter()
+        .any(|item| matches!(item.status(), ItemStatus::Paused | ItemStatus::Queued));
+    let can_start = can_start_site(site_running, has_startable, updating);
     let has_failed = items.iter().any(|item| item.status() == ItemStatus::Failed);
     let logs = model.read(cx).logs_for_site(site);
     let log_count = logs.len();
@@ -162,6 +174,13 @@ fn site_section(
                     "一時停止"
                 } else {
                     "開始"
+                })
+                .tooltip(if updating {
+                    "更新中は開始・一時停止できません"
+                } else if site_running {
+                    "このサイトのダウンロードを一時停止"
+                } else {
+                    "このサイトのダウンロードを開始"
                 })
                 .disabled(!can_start)
                 .on_click(move |_, _, cx| {
@@ -1176,7 +1195,7 @@ fn actions_cell(model: Entity<QueueModel>, item: &QueueItem, running: bool) -> A
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemActions, ItemStatus, open_output_file};
+    use super::{ItemActions, ItemStatus, can_start_site, open_output_file};
 
     #[test]
     fn running_disables_queue_mutations_but_allows_completed_playback() {
@@ -1255,6 +1274,15 @@ mod tests {
                 play_visible: false,
             }
         );
+    }
+
+    #[test]
+    fn updating_disables_site_start_and_pause() {
+        assert!(can_start_site(false, true, false));
+        assert!(can_start_site(true, false, false));
+        assert!(!can_start_site(false, true, true));
+        assert!(!can_start_site(true, false, true));
+        assert!(!can_start_site(false, false, false));
     }
 
     #[test]

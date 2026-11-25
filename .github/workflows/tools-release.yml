@@ -15,6 +15,15 @@ on:
         description: 'eugeneware/ffmpeg-static のタグ（空なら最新）'
         required: false
         default: ''
+      force:
+        description: '上流の更新がなくても配布物を再作成する'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: tools-release-${{ github.workflow }}-${{ inputs.tag }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -23,37 +32,46 @@ jobs:
   publish:
     name: Build & Publish Tools
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check for upstream updates
+        id: preflight
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          YT_DLP_VERSION: ${{ inputs.yt_dlp_version }}
+          FFMPEG_STATIC_TAG: ${{ inputs.ffmpeg_static_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          chmod +x tools/preflight-tools-release.sh
+          tools/preflight-tools-release.sh
+
       - name: Build tool assets
+        if: steps.preflight.outputs.changed == 'true'
         env:
           TAG: ${{ inputs.tag }}
           REPO_URL: https://github.com/${{ github.repository }}
-          YT_DLP_VERSION: ${{ inputs.yt_dlp_version }}
-          FFMPEG_STATIC_TAG: ${{ inputs.ffmpeg_static_tag }}
+          YT_DLP_VERSION: ${{ steps.preflight.outputs.yt_dlp_version }}
+          FFMPEG_STATIC_TAG: ${{ steps.preflight.outputs.ffmpeg_static_tag }}
         run: |
           set -euo pipefail
+          : "${YT_DLP_VERSION:?preflight の yt-dlp バージョンが空です}"
+          : "${FFMPEG_STATIC_TAG:?preflight の ffmpeg-static タグが空です}"
           chmod +x tools/build-release-assets.sh
-          tools/build-release-assets.sh dist-tools
+          tools/build-release-assets.sh dist-tools "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG"
 
       - name: Publish GitHub Release
+        if: steps.preflight.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; replacing assets."
-          else
-            gh release create "$TAG" \
-              --title "Tools" \
-              --notes "yt-dlp と ffmpeg の配布物です。アプリが起動時に取得します。" \
-              --prerelease
-          fi
-          # ツール配布用リリースが GitHub の「Latest」になり、アプリ本体の
-          # 更新確認（releases/latest）を隠さないように prerelease を維持する。
-          gh release edit "$TAG" --prerelease
-          gh release upload "$TAG" dist-tools/* --clobber
+          chmod +x tools/publish-tools-release.sh
+          tools/publish-tools-release.sh dist-tools

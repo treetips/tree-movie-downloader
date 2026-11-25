@@ -1,7 +1,8 @@
 //! yt-dlp と ffmpeg の配布バイナリを GitHub Releases から取得し、設定ディレクトリへ配置する。
 //!
-//! アプリは外部ツールを同梱せず、初回起動時にだけ必要なバイナリをダウンロードする。
+//! アプリは外部ツールを同梱せず、起動時に不足しているバイナリをダウンロードする。
 //! 配布物の一覧は `tools-info.json` で管理し、取得した ZIP は SHA-256 で検証する。
+//! 更新確認で選択されたツールだけを差し替えることもできる。
 //! 呼び出し側は専用スレッドで実行し、進捗はイベントとして UI へ通知する。
 
 use std::collections::{BTreeMap, HashSet};
@@ -195,8 +196,15 @@ impl ToolPaths {
             .map_err(|error| format!("ツールの保存先を作成できません: {error}"))?;
         let json = serde_json::to_string_pretty(installed)
             .map_err(|error| format!("ツールの状態を保存できません: {error}"))?;
-        fs::write(self.installed_path(), json)
-            .map_err(|error| format!("ツールの状態を保存できません: {error}"))
+        let temporary = self
+            .root
+            .join(format!(".installed-{}.tmp", std::process::id()));
+        let result = (|| {
+            fs::write(&temporary, json)?;
+            fs::rename(&temporary, self.installed_path())
+        })();
+        let _ = fs::remove_file(&temporary);
+        result.map_err(|error| format!("ツールの状態を保存できません: {error}"))
     }
 
     /// `.installed.json` に記録されたバージョン。
@@ -254,27 +262,68 @@ fn manifest_url() -> String {
     std::env::var(MANIFEST_URL_ENV).unwrap_or_else(|_| MANIFEST_URL.to_string())
 }
 
-fn bootstrap_with_url(
-    paths: &ToolPaths,
-    url: &str,
-    events: &smol::channel::Sender<BootstrapEvent>,
-) -> Result<(), String> {
-    let platform = Platform::current().ok_or_else(|| {
+/// 配布情報を確認し、更新が必要なツールだけを返す。呼び出し側は専用スレッドで実行する。
+pub fn check_for_tool_updates(paths: ToolPaths) -> Result<Vec<ToolEntry>, String> {
+    check_for_tool_updates_with_url(&paths, &manifest_url())
+}
+
+fn check_for_tool_updates_with_url(paths: &ToolPaths, url: &str) -> Result<Vec<ToolEntry>, String> {
+    let platform = current_platform()?;
+    let info = fetch_manifest(url)?;
+    let entries = required_entries(&info, platform)?;
+    let installed = paths.load_installed();
+    Ok(pending_entries(paths, &installed, &entries)
+        .into_iter()
+        .cloned()
+        .collect())
+}
+
+/// 確認済みのツールだけを更新する。呼び出し側は専用スレッドで実行する。
+pub fn install_tool_updates(
+    paths: ToolPaths,
+    entries: Vec<ToolEntry>,
+    events: smol::channel::Sender<BootstrapEvent>,
+) {
+    let result = install_entries(&paths, &entries, &events);
+    let event = match result {
+        Ok(()) => BootstrapEvent::Ready,
+        Err(message) => BootstrapEvent::Failed(message),
+    };
+    let _ = events.send_blocking(event);
+}
+
+fn current_platform() -> Result<Platform, String> {
+    Platform::current().ok_or_else(|| {
         format!(
             "この環境（{} / {}）向けのツール配布はありません。",
             std::env::consts::OS,
             std::env::consts::ARCH
         )
-    })?;
+    })
+}
+
+fn bootstrap_with_url(
+    paths: &ToolPaths,
+    url: &str,
+    events: &smol::channel::Sender<BootstrapEvent>,
+) -> Result<(), String> {
+    let platform = current_platform()?;
     let info = fetch_manifest(url)?;
     let entries = required_entries(&info, platform)?;
+    let installed = paths.load_installed();
+    let pending: Vec<ToolEntry> = pending_entries(paths, &installed, &entries)
+        .into_iter()
+        .cloned()
+        .collect();
+    install_entries(paths, &pending, events)
+}
 
-    fs::create_dir_all(paths.root())
-        .map_err(|error| format!("ツールの保存先を作成できません: {error}"))?;
-    cleanup_temporary_files(paths.root());
-
-    let mut installed = paths.load_installed();
-    let pending: Vec<&ToolEntry> = entries
+fn pending_entries<'a>(
+    paths: &ToolPaths,
+    installed: &InstalledTools,
+    entries: &'a [ToolEntry],
+) -> Vec<&'a ToolEntry> {
+    entries
         .iter()
         .filter(|entry| {
             let is_current = installed.get(&entry.name).is_some_and(|tool| {
@@ -282,10 +331,21 @@ fn bootstrap_with_url(
             });
             !(is_current && paths.is_tool_complete(&entry.name))
         })
-        .collect();
-    let steps = pending.len();
+        .collect()
+}
 
-    for (index, entry) in pending.iter().enumerate() {
+fn install_entries(
+    paths: &ToolPaths,
+    entries: &[ToolEntry],
+    events: &smol::channel::Sender<BootstrapEvent>,
+) -> Result<(), String> {
+    fs::create_dir_all(paths.root())
+        .map_err(|error| format!("ツールの保存先を作成できません: {error}"))?;
+    cleanup_temporary_files(paths.root());
+
+    let mut installed = paths.load_installed();
+    let steps = entries.len();
+    for (index, entry) in entries.iter().enumerate() {
         let step = index + 1;
         install_entry(paths, entry, events, step, steps)?;
         installed.set(
@@ -397,8 +457,12 @@ fn install_entry(
     let staging = paths
         .root()
         .join(format!(".staging-{}-{}", entry.name, std::process::id()));
+    let backup = paths
+        .root()
+        .join(format!(".backup-{}-{}", entry.name, std::process::id()));
     let _ = fs::remove_file(&archive);
     let _ = fs::remove_dir_all(&staging);
+    remove_path(&backup);
 
     let result = (|| {
         let actual = download_entry(entry, &archive, events, step, steps)?;
@@ -419,15 +483,24 @@ fn install_entry(
         extract_expected_files(&archive, &staging, &entry.name)?;
 
         let destination = paths.tool_dir(&entry.name);
-        if destination.is_dir() {
-            fs::remove_dir_all(&destination)
-                .map_err(|error| format!("古い {} を削除できません: {error}", entry.name))?;
-        } else if destination.exists() {
-            fs::remove_file(&destination)
-                .map_err(|error| format!("古い {} を削除できません: {error}", entry.name))?;
+        let had_destination = destination.exists();
+        if had_destination {
+            fs::rename(&destination, &backup).map_err(|error| {
+                format!("古い {} をバックアップできません: {error}", entry.name)
+            })?;
         }
-        fs::rename(&staging, &destination)
-            .map_err(|error| format!("{} を配置できません: {error}", entry.name))?;
+        if let Err(error) = fs::rename(&staging, &destination) {
+            if had_destination {
+                fs::rename(&backup, &destination).map_err(|restore_error| {
+                    format!(
+                        "{} を配置できません: {error}。古いツールも復元できませんでした: {restore_error}",
+                        entry.name
+                    )
+                })?;
+            }
+            return Err(format!("{} を配置できません: {error}", entry.name));
+        }
+        remove_path(&backup);
         Ok(())
     })();
 
@@ -670,6 +743,14 @@ fn set_executable(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn remove_path(path: &Path) {
+    if path.is_dir() {
+        let _ = fs::remove_dir_all(path);
+    } else {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn cleanup_temporary_files(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -679,7 +760,11 @@ fn cleanup_temporary_files(root: &Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !(name.starts_with(".download-") || name.starts_with(".staging-")) {
+        if !(name.starts_with(".download-")
+            || name.starts_with(".staging-")
+            || name.starts_with(".backup-")
+            || name.starts_with(".installed-"))
+        {
             continue;
         }
         let path = entry.path();
@@ -886,6 +971,154 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn write_executable(path: &Path, contents: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+        set_executable(path).unwrap();
+    }
+
+    fn write_complete_tools(paths: &ToolPaths) {
+        write_executable(&paths.yt_dlp(), b"old yt-dlp");
+        write_executable(&paths.ffmpeg(), b"old ffmpeg");
+        write_executable(&paths.ffprobe(), b"old ffprobe");
+    }
+
+    fn record_versions(paths: &ToolPaths, yt_dlp: &str, ffmpeg: &str) {
+        let mut installed = InstalledTools::default();
+        let platform = Platform::current().unwrap().id();
+        for (name, version) in [(YT_DLP, yt_dlp), (FFMPEG, ffmpeg)] {
+            installed.set(
+                name,
+                InstalledTool {
+                    version: version.to_string(),
+                    platform: platform.clone(),
+                },
+            );
+        }
+        paths.save_installed(&installed).unwrap();
+    }
+
+    fn current_entry(name: &str) -> ToolEntry {
+        entry(name, &Platform::current().unwrap().id(), true)
+    }
+
+    #[test]
+    fn finds_no_updates_when_versions_and_binaries_match() {
+        let root = temp_dir("up-to-date");
+        let paths = ToolPaths::at(&root);
+        write_complete_tools(&paths);
+        record_versions(&paths, "1.0.0", "1.0.0");
+        let entries = vec![current_entry(YT_DLP), current_entry(FFMPEG)];
+
+        let pending = pending_entries(&paths, &paths.load_installed(), &entries);
+
+        assert!(pending.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selects_only_the_tool_with_a_different_version() {
+        let root = temp_dir("version-change");
+        let paths = ToolPaths::at(&root);
+        write_complete_tools(&paths);
+        record_versions(&paths, "1.0.0", "1.0.0");
+        let mut yt_dlp = current_entry(YT_DLP);
+        yt_dlp.version = "2.0.0".to_string();
+        let entries = vec![yt_dlp, current_entry(FFMPEG)];
+
+        let pending = pending_entries(&paths, &paths.load_installed(), &entries);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, YT_DLP);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selects_a_tool_when_its_binary_is_missing() {
+        let root = temp_dir("missing-binary");
+        let paths = ToolPaths::at(&root);
+        write_complete_tools(&paths);
+        record_versions(&paths, "1.0.0", "1.0.0");
+        fs::remove_file(paths.ffprobe()).unwrap();
+        let entries = vec![current_entry(YT_DLP), current_entry(FFMPEG)];
+
+        let pending = pending_entries(&paths, &paths.load_installed(), &entries);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, FFMPEG);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selects_a_tool_when_its_recorded_platform_differs() {
+        let root = temp_dir("platform-change");
+        let paths = ToolPaths::at(&root);
+        write_complete_tools(&paths);
+        record_versions(&paths, "1.0.0", "1.0.0");
+        let mut yt_dlp = current_entry(YT_DLP);
+        yt_dlp.platform = "another-platform".to_string();
+        let entries = vec![yt_dlp, current_entry(FFMPEG)];
+
+        let pending = pending_entries(&paths, &paths.load_installed(), &entries);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, YT_DLP);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checks_for_updates_even_when_all_tools_are_installed() {
+        let root = temp_dir("check-updates");
+        let paths = ToolPaths::at(&root);
+        write_complete_tools(&paths);
+        record_versions(&paths, "1.0.0", "1.0.0");
+        let platform = Platform::current().unwrap().id();
+        let manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "tools": [
+                {
+                    "name": YT_DLP,
+                    "version": "2.0.0",
+                    "platform": platform,
+                    "url": "https://example.com/yt-dlp.zip",
+                    "sha256": "a".repeat(64),
+                    "required": true
+                },
+                {
+                    "name": FFMPEG,
+                    "version": "1.0.0",
+                    "platform": platform,
+                    "url": "https://example.com/ffmpeg.zip",
+                    "sha256": "b".repeat(64),
+                    "required": true
+                }
+            ]
+        });
+        let (url, server) = serve_once(serde_json::to_vec(&manifest).unwrap());
+
+        let updates = check_for_tool_updates_with_url(&paths, &url).unwrap();
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].name, YT_DLP);
+        assert_eq!(updates[0].version, "2.0.0");
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_empty_update_selection_finishes_without_installing() {
+        let root = temp_dir("empty-selection");
+        let paths = ToolPaths::at(&root);
+        write_complete_tools(&paths);
+        record_versions(&paths, "1.0.0", "1.0.0");
+        let (sender, receiver) = smol::channel::unbounded();
+
+        install_tool_updates(paths, Vec::new(), sender);
+
+        assert_eq!(receiver.try_recv().unwrap(), BootstrapEvent::Ready);
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn serve_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
         use std::net::TcpListener;
 
@@ -935,6 +1168,38 @@ mod tests {
         install_entry(&paths, &entry, &sender, 1, 1).unwrap();
 
         assert!(is_executable_file(&paths.yt_dlp()));
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installs_only_the_selected_tool_and_preserves_the_other() {
+        let root = temp_dir("selective-install");
+        let archive = root.join("fixture.zip");
+        write_zip(&archive, &[("yt-dlp", b"new yt-dlp")]);
+        let bytes = fs::read(&archive).unwrap();
+        let (url, server) = serve_once(bytes.clone());
+        let paths = ToolPaths::at(root.join("tools"));
+        write_complete_tools(&paths);
+        record_versions(&paths, "1.0.0", "1.0.0");
+        let entry = ToolEntry {
+            name: YT_DLP.to_string(),
+            version: "2.0.0".to_string(),
+            platform: Platform::current().unwrap().id(),
+            url,
+            sha256: sha256_bytes(&bytes),
+            required: true,
+        };
+        let (sender, _receiver) = smol::channel::unbounded();
+
+        install_entries(&paths, &[entry], &sender).unwrap();
+
+        assert_eq!(fs::read(paths.yt_dlp()).unwrap(), b"new yt-dlp");
+        assert_eq!(fs::read(paths.ffmpeg()).unwrap(), b"old ffmpeg");
+        assert_eq!(fs::read(paths.ffprobe()).unwrap(), b"old ffprobe");
+        let installed = paths.load_installed();
+        assert_eq!(installed.get(YT_DLP).unwrap().version, "2.0.0");
+        assert_eq!(installed.get(FFMPEG).unwrap().version, "1.0.0");
         server.join().unwrap();
         let _ = fs::remove_dir_all(root);
     }
