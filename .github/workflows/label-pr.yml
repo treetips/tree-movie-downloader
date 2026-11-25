@@ -81,7 +81,7 @@ jobs:
 
           # タイトル変更時の再分類に備え、PRに付いている自動ラベルを外して付け直す。
           auto_labels=(feature fix performance improvement documentation dependencies)
-          pr_labels="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.[].name')"
+          pr_labels="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')"
           for l in "${auto_labels[@]}"; do
             if grep -Fxq "$l" <<< "$pr_labels"; then
               gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$l"
