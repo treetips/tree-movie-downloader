@@ -13,6 +13,8 @@ jobs:
       - name: Add assignee
         uses: actions/github-script@v9
         with:
+          # GitHub APIの一時的な5xxは自動リトライし、恒久的な4xxは失敗として扱う。
+          retries: 3
           script: |
             await github.rest.issues.addAssignees({
               owner: context.repo.owner,

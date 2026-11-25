@@ -10,6 +10,8 @@ on:
     types: [opened, edited, reopened]
 
 permissions:
+  # 不足しているリリース分類用ラベルを作成するために必要。
+  issues: write
   pull-requests: write
 
 jobs:
@@ -60,10 +62,30 @@ jobs:
               ;;
           esac
 
-          # タイトル変更時の再分類に備え、既存の自動ラベルを外して付け直す。
+          # 必要なラベルが削除・未作成の環境でも再現できるように自動作成する。
+          if [[ -n "$label" ]]; then
+            existing_labels="$(gh label list --repo "$REPO" --limit 1000 --json name --jq '.[].name')"
+            if ! grep -Fxq "$label" <<< "$existing_labels"; then
+              case "$label" in
+                feature)       label_description="新機能"; label_color="1d76db" ;;
+                fix)           label_description="バグ修正"; label_color="d73a4a" ;;
+                performance)   label_description="パフォーマンス改善"; label_color="fbca04" ;;
+                improvement)   label_description="改善"; label_color="a2eeef" ;;
+                documentation) label_description="ドキュメント"; label_color="0075ca" ;;
+                dependencies)  label_description="依存パッケージ更新"; label_color="0366d6" ;;
+              esac
+              gh label create "$label" --repo "$REPO" \
+                --description "$label_description" --color "$label_color"
+            fi
+          fi
+
+          # タイトル変更時の再分類に備え、PRに付いている自動ラベルを外して付け直す。
           auto_labels=(feature fix performance improvement documentation dependencies)
+          pr_labels="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.[].name')"
           for l in "${auto_labels[@]}"; do
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$l" 2>/dev/null || true
+            if grep -Fxq "$l" <<< "$pr_labels"; then
+              gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$l"
+            fi
           done
 
           if [[ -n "$label" ]]; then
