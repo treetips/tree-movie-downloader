@@ -267,6 +267,7 @@ impl AppView {
         let add_audio_select = self.add_audio.clone();
         let add_container_select = self.add_container.clone();
         let add_destination_select = self.add_destination.clone();
+        let app_view = cx.entity();
         let focus_requested = std::cell::Cell::new(false);
 
         window.open_dialog(cx, move |dialog, window, dialog_cx| {
@@ -276,6 +277,7 @@ impl AppView {
             let confirm_audio = add_audio_select.clone();
             let confirm_container = add_container_select.clone();
             let confirm_destination = add_destination_select.clone();
+            let confirm_view = app_view.clone();
 
             if !focus_requested.replace(true) {
                 textarea.focus_handle(dialog_cx).focus(window, dialog_cx);
@@ -372,6 +374,13 @@ impl AppView {
                                 .primary()
                                 .label("キューに追加")
                                 .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                    if confirm_view.read(cx).running {
+                                        window.push_notification(
+                                            Notification::warning("実行中はURLを追加できません"),
+                                            cx,
+                                        );
+                                        return;
+                                    }
                                     let value = add_textarea.read(cx).value();
                                     if value.trim().is_empty() {
                                         window.push_notification(
@@ -514,9 +523,11 @@ impl AppView {
             return;
         }
         let model = self.queue.clone();
+        let app_view = cx.entity();
 
         window.open_alert_dialog(cx, move |alert, _, dialog_cx| {
             let clear_model = model.clone();
+            let confirm_view = app_view.clone();
 
             alert
                 .icon(
@@ -533,7 +544,14 @@ impl AppView {
                 .ok_text("空にする")
                 .cancel_text("キャンセル")
                 .ok_variant(ButtonVariant::Danger)
-                .on_ok(move |_, _, cx| {
+                .on_ok(move |_, window, cx| {
+                    if confirm_view.read(cx).running {
+                        window.push_notification(
+                            Notification::warning("実行中はキューを空にできません"),
+                            cx,
+                        );
+                        return false;
+                    }
                     clear_model.update(cx, |model, cx| {
                         model.clear();
                         cx.emit(QueueEvent::Changed);
@@ -1558,14 +1576,14 @@ impl Render for AppView {
                     this.open_add_urls_dialog(window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &StartOrPause, _, cx| {
-                if !this.tool_bootstrap.read(cx).is_ready() {
+            .on_action(cx.listener(|this, _: &StartOrPause, window, cx| {
+                if !this.tool_bootstrap.read(cx).is_ready() || window.has_active_dialog(cx) {
                     return;
                 }
                 this.toggle_running(cx);
             }))
-            .on_action(cx.listener(|this, _: &RetryFailed, _, cx| {
-                if !this.tool_bootstrap.read(cx).is_ready() {
+            .on_action(cx.listener(|this, _: &RetryFailed, window, cx| {
+                if !this.tool_bootstrap.read(cx).is_ready() || window.has_active_dialog(cx) {
                     return;
                 }
                 this.retry_failed(cx);

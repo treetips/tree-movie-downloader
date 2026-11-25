@@ -1086,18 +1086,11 @@ fn open_output_file(path: &str) -> Result<(), String> {
         return Err("ファイルが見つかりません".to_string());
     }
 
-    let status = Command::new("/usr/bin/open")
+    Command::new("/usr/bin/open")
         .arg(path)
-        .status()
-        .map_err(|error| format!("ファイルを開けませんでした: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "ファイルを開けませんでした（終了コード {}）。",
-            status.code().unwrap_or(-1)
-        ))
-    }
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("ファイルを開けませんでした: {error}"))
 }
 
 fn actions_cell(model: Entity<QueueModel>, item: &QueueItem, running: bool) -> AnyElement {
@@ -1107,9 +1100,7 @@ fn actions_cell(model: Entity<QueueModel>, item: &QueueItem, running: bool) -> A
     let remove_id = item.id();
     let actions = ItemActions::new(running, item.status());
     let play_path = if actions.play_visible {
-        item.output_path()
-            .filter(|path| Path::new(*path).is_file())
-            .map(str::to_string)
+        item.output_path().map(str::to_string)
     } else {
         None
     };
