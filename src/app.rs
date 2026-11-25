@@ -36,7 +36,9 @@ use crate::queue_table::render_queue;
 use crate::settings_page::SettingsPage;
 use crate::tool_bootstrap::{BootstrapPhase, ToolBootstrap};
 use crate::tools;
-use crate::update_controller::{UpdateController, UpdateState};
+use crate::update_controller::{
+    InstallAvailableUpdates, LibraryUpdateState, UpdateController, UpdateState,
+};
 use crate::wallpaper::{WallpaperState, wallpaper_layer, wallpaper_source_image};
 
 /// 画面上部のメニューから切り替える画面。
@@ -77,10 +79,32 @@ impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tool_bootstrap = cx.new(|_| ToolBootstrap::new());
         tool_bootstrap.update(cx, |bootstrap, cx| bootstrap.start(cx));
-        let bootstrap_subscription = cx.observe(&tool_bootstrap, |_, _, cx| cx.notify());
         let update_controller = cx.new(|_| UpdateController::new());
         update_controller.update(cx, |controller, cx| controller.check_background(window, cx));
         let update_subscription = cx.observe(&update_controller, |_, _, cx| cx.notify());
+        let library_update_controller = update_controller.clone();
+        let bootstrap_subscription = cx.observe(&tool_bootstrap, move |_, bootstrap, cx| {
+            cx.notify();
+            let phase = bootstrap.read(cx).phase().clone();
+            match phase {
+                BootstrapPhase::Ready => {
+                    library_update_controller.update(cx, |controller, cx| {
+                        controller.check_libraries_background(cx);
+                    });
+                }
+                BootstrapPhase::Failed(_) => {
+                    library_update_controller.update(cx, |controller, cx| {
+                        controller.mark_library_check_unavailable(cx);
+                    });
+                }
+                _ => {}
+            }
+        });
+        if tool_bootstrap.read(cx).is_ready() {
+            update_controller.update(cx, |controller, cx| {
+                controller.check_libraries_background(cx);
+            });
+        }
         let queue = cx.new(|_| QueueModel::new());
         let url_input = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder(
@@ -211,14 +235,93 @@ impl AppView {
             .update(cx, |controller, cx| controller.check_manually(window, cx));
     }
 
+    fn is_updating(&self, cx: &Context<Self>) -> bool {
+        let controller = self.update_controller.read(cx);
+        controller.is_installing() || controller.is_library_installing()
+    }
+
+    fn can_start_update(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.running {
+            window.push_notification(
+                Notification::warning("実行中のダウンロードを停止してから更新を開始してください。"),
+                cx,
+            );
+            return false;
+        }
+        true
+    }
+
+    fn open_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_start_update(window, cx) {
+            return;
+        }
+        self.update_controller.update(cx, |controller, cx| {
+            controller.open_available_dialog(window, cx)
+        });
+    }
+
+    fn open_app_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_start_update(window, cx) {
+            return;
+        }
+        self.update_controller.update(cx, |controller, cx| {
+            controller.open_app_update_dialog(window, cx)
+        });
+    }
+
+    fn open_library_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_start_update(window, cx) {
+            return;
+        }
+        self.update_controller.update(cx, |controller, cx| {
+            controller.open_library_update_dialog(window, cx)
+        });
+    }
+
+    fn install_dialog_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_start_update(window, cx) {
+            return;
+        }
+        self.update_controller.update(cx, |controller, cx| {
+            controller.install_dialog_updates(window, cx)
+        });
+    }
+
+    fn retry_app_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_start_update(window, cx) {
+            return;
+        }
+        self.update_controller
+            .update(cx, |controller, cx| controller.retry_app(window, cx));
+    }
+
+    fn retry_library_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_start_update(window, cx) {
+            return;
+        }
+        self.update_controller
+            .update(cx, |controller, cx| controller.retry_libraries(window, cx));
+    }
+
+    fn retry_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_start_update(window, cx) {
+            return;
+        }
+        self.update_controller
+            .update(cx, |controller, cx| controller.retry(window, cx));
+    }
+
     fn toggle_running(&mut self, cx: &mut Context<Self>) {
+        if self.is_updating(cx) {
+            return;
+        }
         self.downloads
             .update(cx, |manager, cx| manager.toggle_all(cx));
     }
 
     /// 待機中・一時停止の項目をすべて開始する。
     fn start_pending(&mut self, cx: &mut Context<Self>) {
-        if self.running {
+        if self.running || self.is_updating(cx) {
             return;
         }
         self.downloads
@@ -684,33 +787,55 @@ impl AppView {
     fn render_about_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let yt_dlp_version =
             tools::installed_version(tools::YT_DLP).unwrap_or_else(|| "未取得".to_string());
-        let update_state = self.update_controller.read(cx).state().clone();
-        let update_status = self.update_controller.read(cx).status_text();
-        let checking = self.update_controller.read(cx).is_checking();
-        let installing = self.update_controller.read(cx).is_installing();
-        let available_info = match &update_state {
-            UpdateState::Available(info) => Some(info.clone()),
-            _ => None,
+        let ffmpeg_version =
+            tools::installed_version(tools::FFMPEG).unwrap_or_else(|| "未取得".to_string());
+        let (update_state, library_state, update_status, library_status, checking, installing) = {
+            let controller = self.update_controller.read(cx);
+            (
+                controller.state().clone(),
+                controller.library_state().clone(),
+                controller.status_text(),
+                controller.library_status_text(),
+                controller.is_checking() || controller.is_library_checking(),
+                controller.is_installing() || controller.is_library_installing(),
+            )
         };
         let update_action = match &update_state {
-            UpdateState::Available(_) => available_info.map(|info| {
-                Button::new("install-update-about")
+            UpdateState::Available(_) => Some(
+                Button::new("install-app-update-about")
                     .primary()
                     .label("インストール")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let info = info.clone();
-                        this.update_controller.update(cx, |controller, cx| {
-                            controller.open_available_dialog(info, window, cx);
-                        });
-                    }))
-            }),
-            UpdateState::Failed(_) => Some(
-                Button::new("retry-update-about")
-                    .label("再実行")
+                    .disabled(checking || installing)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.update_controller.update(cx, |controller, cx| {
-                            controller.retry(window, cx);
-                        });
+                        this.open_app_update_dialog(window, cx);
+                    })),
+            ),
+            UpdateState::Failed(_) => Some(
+                Button::new("retry-app-update-about")
+                    .label("再実行")
+                    .disabled(checking || installing)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.retry_app_update(window, cx);
+                    })),
+            ),
+            _ => None,
+        };
+        let library_update_action = match &library_state {
+            LibraryUpdateState::Available(_) => Some(
+                Button::new("install-library-update-about")
+                    .primary()
+                    .label("インストール")
+                    .disabled(checking || installing)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_library_update_dialog(window, cx);
+                    })),
+            ),
+            LibraryUpdateState::Failed(_) => Some(
+                Button::new("retry-library-update-about")
+                    .label("再実行")
+                    .disabled(checking || installing)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.retry_library_update(window, cx);
                     })),
             ),
             _ => None,
@@ -761,62 +886,155 @@ impl AppView {
                         ))
                         .child(about_row("Copyright", "Copyright @2026 treetips555", cx))
                         .child(about_row("yt-dlp", yt_dlp_version, cx))
+                        .child(about_row("ffmpeg", ffmpeg_version, cx))
                         .child(Separator::horizontal())
                         .child(
                             v_flex()
                                 .gap_2()
                                 .child(div().text_sm().font_medium().child("アップデート"))
                                 .child(
+                                    Button::new("check-update")
+                                        .label("アップデートを確認")
+                                        .loading(checking)
+                                        .disabled(checking || installing)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.check_for_updates(window, cx);
+                                        })),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .child(div().text_sm().font_medium().child("アプリ更新"))
+                                .child(
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(update_status),
                                 )
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            Button::new("check-update")
-                                                .label("アップデートを確認")
-                                                .loading(checking)
-                                                .disabled(checking || installing)
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.check_for_updates(window, cx);
-                                                })),
-                                        )
-                                        .children(update_action),
-                                )
+                                .child(h_flex().gap_2().children(update_action))
                                 .children(match &update_state {
                                     UpdateState::Idle => None,
                                     UpdateState::Checking => Some(
-                                        Alert::info("about-update-alert", "更新を確認しています…")
-                                            .w_full(),
+                                        Alert::info(
+                                            "about-app-update-alert",
+                                            "アプリの更新を確認しています…",
+                                        )
+                                        .w_full(),
                                     ),
                                     UpdateState::UpToDate => Some(
                                         Alert::success(
-                                            "about-update-alert",
-                                            "お使いのバージョンは最新です。",
+                                            "about-app-update-alert",
+                                            "アプリは最新です。",
+                                        )
+                                        .w_full(),
+                                    ),
+                                    UpdateState::CheckFailed(message) => Some(
+                                        Alert::error(
+                                            "about-app-update-alert",
+                                            format!(
+                                                "アプリの更新を確認できませんでした。{message}"
+                                            ),
                                         )
                                         .w_full(),
                                     ),
                                     UpdateState::Available(info) => Some(
                                         Alert::warning(
-                                            "about-update-alert",
-                                            format!("v{} にアップデートできます。", info.version),
+                                            "about-app-update-alert",
+                                            format!(
+                                                "アプリを v{} にアップデートできます。",
+                                                info.version
+                                            ),
                                         )
                                         .w_full(),
                                     ),
                                     UpdateState::Installing(phase) => Some(
                                         Alert::info(
-                                            "about-update-alert",
-                                            format!("インストール中: {}", phase.label()),
+                                            "about-app-update-alert",
+                                            format!("アプリをインストール中: {}", phase.label()),
                                         )
                                         .w_full(),
                                     ),
                                     UpdateState::Failed(message) => Some(
                                         Alert::error(
-                                            "about-update-alert",
-                                            format!("インストールに失敗しました。{message}"),
+                                            "about-app-update-alert",
+                                            format!(
+                                                "アプリのインストールに失敗しました。{message}"
+                                            ),
+                                        )
+                                        .w_full(),
+                                    ),
+                                }),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .child(div().text_sm().font_medium().child("ライブラリ更新"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(library_status),
+                                )
+                                .child(h_flex().gap_2().children(library_update_action))
+                                .children(match &library_state {
+                                    LibraryUpdateState::Idle => None,
+                                    LibraryUpdateState::Checking => Some(
+                                        Alert::info(
+                                            "about-library-update-alert",
+                                            "ライブラリの更新を確認しています…",
+                                        )
+                                        .w_full(),
+                                    ),
+                                    LibraryUpdateState::UpToDate => Some(
+                                        Alert::success(
+                                            "about-library-update-alert",
+                                            "ライブラリは最新です。",
+                                        )
+                                        .w_full(),
+                                    ),
+                                    LibraryUpdateState::CheckFailed(message) => Some(
+                                        Alert::error(
+                                            "about-library-update-alert",
+                                            format!(
+                                                "ライブラリの更新を確認できませんでした。{message}"
+                                            ),
+                                        )
+                                        .w_full(),
+                                    ),
+                                    LibraryUpdateState::Available(entries) => Some(
+                                        Alert::warning(
+                                            "about-library-update-alert",
+                                            format!(
+                                                "{} をアップデートできます。",
+                                                entries
+                                                    .iter()
+                                                    .map(|entry| format!(
+                                                        "{} {}",
+                                                        entry.name, entry.version
+                                                    ))
+                                                    .collect::<Vec<_>>()
+                                                    .join("、")
+                                            ),
+                                        )
+                                        .w_full(),
+                                    ),
+                                    LibraryUpdateState::Installing(phase) => Some(
+                                        Alert::info(
+                                            "about-library-update-alert",
+                                            format!(
+                                                "ライブラリをインストール中: {}",
+                                                phase.label()
+                                            ),
+                                        )
+                                        .w_full(),
+                                    ),
+                                    LibraryUpdateState::Failed(message) => Some(
+                                        Alert::error(
+                                            "about-library-update-alert",
+                                            format!(
+                                                "ライブラリのインストールに失敗しました。{message}"
+                                            ),
                                         )
                                         .w_full(),
                                     ),
@@ -857,13 +1075,20 @@ impl AppView {
 
     /// タイトルバー右端の更新エリア。
     fn render_update_area(&self, cx: &mut Context<Self>) -> AnyElement {
-        let controller = self.update_controller.read(cx);
-        let state = controller.state().clone();
-        let no_update_visible = controller.no_update_visible();
+        let (state, library_state, available_label, no_update_visible) = {
+            let controller = self.update_controller.read(cx);
+            (
+                controller.state().clone(),
+                controller.library_state().clone(),
+                controller.available_update_label(),
+                controller.no_update_visible(),
+            )
+        };
 
-        match state {
-            UpdateState::Idle => div().into_any_element(),
-            UpdateState::Checking => h_flex()
+        if matches!(state, UpdateState::Checking)
+            || matches!(library_state, LibraryUpdateState::Checking)
+        {
+            return h_flex()
                 .items_center()
                 .gap_2()
                 .px_2()
@@ -877,81 +1102,49 @@ impl AppView {
                         .text_color(cx.theme().muted_foreground)
                         .child("アップデートを確認中"),
                 )
-                .into_any_element(),
-            UpdateState::UpToDate if no_update_visible => h_flex()
-                .id("update-area-uptodate")
-                .items_center()
-                .gap_2()
+                .into_any_element();
+        }
+
+        let install_progress = match (&state, &library_state) {
+            (UpdateState::Installing(phase), _) => Some((phase.label(), phase.percent())),
+            (_, LibraryUpdateState::Installing(phase)) => Some((phase.label(), phase.percent())),
+            _ => None,
+        };
+        if let Some((label, percent)) = install_progress {
+            let determinate = percent.is_some();
+            return v_flex()
+                .gap_1()
                 .px_2()
                 .py_1()
                 .rounded_md()
-                .bg(cx.theme().muted.opacity(0.35))
-                .cursor_pointer()
+                .bg(cx.theme().primary.opacity(0.12))
+                .min_w(px(200.))
                 .child(
-                    Icon::new(IconName::Check)
-                        .xsmall()
-                        .text_color(cx.theme().foreground),
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Spinner::new().xsmall().color(cx.theme().primary))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_medium()
+                                .text_color(cx.theme().primary)
+                                .child(format!("インストール中 {label}")),
+                        ),
                 )
                 .child(
-                    div()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(cx.theme().foreground)
-                        .child("アップデートは有りません"),
+                    Progress::new("title-update-progress")
+                        .value(percent.unwrap_or(0.0))
+                        .loading(!determinate)
+                        .h(px(3.)),
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.update_controller
-                        .update(cx, |controller, cx| controller.dismiss(cx));
-                }))
-                .into_any_element(),
-            UpdateState::UpToDate => div().into_any_element(),
-            UpdateState::Available(info) => Button::new("update-area-available")
-                .info()
-                .small()
-                .icon(IconName::Download)
-                .label("アップデートが有ります")
-                .bg(cx.theme().blue)
-                .text_color(cx.theme().background)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let info = info.clone();
-                    this.update_controller.update(cx, |controller, cx| {
-                        controller.open_available_dialog(info, window, cx);
-                    });
-                }))
-                .into_any_element(),
-            UpdateState::Installing(phase) => {
-                let percent = phase.percent().unwrap_or(0.0);
-                let label = phase.label();
-                let determinate = phase.percent().is_some();
-                v_flex()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(cx.theme().primary.opacity(0.12))
-                    .min_w(px(160.))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(Spinner::new().xsmall().color(cx.theme().primary))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_color(cx.theme().primary)
-                                    .child(format!("インストール中 {label}")),
-                            ),
-                    )
-                    .child(
-                        Progress::new("title-update-progress")
-                            .value(percent)
-                            .loading(!determinate)
-                            .h(px(3.)),
-                    )
-                    .into_any_element()
-            }
-            UpdateState::Failed(_) => h_flex()
+                .into_any_element();
+        }
+
+        if matches!(state, UpdateState::Failed(_))
+            || matches!(library_state, LibraryUpdateState::Failed(_))
+        {
+            return h_flex()
                 .items_center()
                 .gap_2()
                 .px_2()
@@ -975,12 +1168,41 @@ impl AppView {
                         .xsmall()
                         .label("再実行")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.update_controller.update(cx, |controller, cx| {
-                                controller.retry(window, cx);
-                            });
+                            this.retry_update(window, cx);
                         })),
                 )
-                .into_any_element(),
+                .into_any_element();
+        }
+
+        if let Some(label) = available_label {
+            return Button::new("update-area-available")
+                .info()
+                .small()
+                .icon(IconName::Download)
+                .label(label)
+                .bg(cx.theme().blue)
+                .text_color(cx.theme().background)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_update_dialog(window, cx);
+                }))
+                .into_any_element();
+        }
+
+        if no_update_visible {
+            Button::new("update-area-uptodate")
+                .ghost()
+                .small()
+                .icon(IconName::Check)
+                .label("アップデートは有りません")
+                .bg(cx.theme().muted.opacity(0.35))
+                .text_color(cx.theme().foreground)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.update_controller
+                        .update(cx, |controller, cx| controller.dismiss(cx));
+                }))
+                .into_any_element()
+        } else {
+            div().into_any_element()
         }
     }
 
@@ -1165,7 +1387,7 @@ impl AppView {
                                         .text_sm()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(
-                                            "yt-dlp と ffmpeg を GitHub Releases からダウンロードします。初回起動時のみで、次回からは再ダウンロードしません。",
+                                            "yt-dlp と ffmpeg のうち、未準備・更新対象のツールを GitHub Releases から取得します。日常の更新確認とは分けて扱い、更新の自動インストールはしません。",
                                         ),
                                 ),
                         ),
@@ -1205,9 +1427,11 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let running = self.running;
+        let updating = self.is_updating(cx);
         let can_add = Self::can_add_urls(running);
         let can_clear = Self::can_clear_queue(running, empty);
-        let can_start = Self::can_start_queue(running, self.queue.read(cx).has_pending());
+        let can_start =
+            Self::can_start_queue(running, self.queue.read(cx).has_pending()) && !updating;
 
         h_flex()
             .h_12()
@@ -1235,7 +1459,9 @@ impl AppView {
                 Button::new("start-queue")
                     .icon(IconName::Play)
                     .label("開始する")
-                    .tooltip(if running {
+                    .tooltip(if updating {
+                        "更新中は開始できません"
+                    } else if running {
                         "実行中は開始できません"
                     } else {
                         "待機中のキューを開始"
@@ -1288,7 +1514,13 @@ impl AppView {
         let content: AnyElement = if total == 0 {
             render_empty_queue(cx).into_any_element()
         } else {
-            render_queue(&self.queue, &self.downloads, self.running, cx)
+            render_queue(
+                &self.queue,
+                &self.downloads,
+                self.running,
+                self.is_updating(cx),
+                cx,
+            )
         };
 
         v_flex()
@@ -1588,6 +1820,11 @@ impl Render for AppView {
                 }
                 this.retry_failed(cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &InstallAvailableUpdates, window, cx| {
+                    this.install_dialog_updates(window, cx);
+                }),
+            )
             .child(self.render_title_bar(cx))
             .when(tools_ready, |this| this.child(self.render_top_menu(cx)))
             .child(

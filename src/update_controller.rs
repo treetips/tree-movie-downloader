@@ -1,7 +1,7 @@
-//! アプリ本体の更新状態とダイアログ。
+//! アプリ本体とライブラリの更新状態・ダイアログ。
 //!
-//! 通信とファイル操作は [`crate::updater`] が担い、ここでは進捗をUI向けの状態へ
-//! 変換して、タイトルバー・About・確認ダイアログへ反映する。
+//! 通信とファイル操作は [`crate::updater`] と [`crate::tools`] が担い、ここでは
+//! 2種類の更新を独立した状態として保持し、タイトルバー・About・確認ダイアログへ反映する。
 
 use std::time::Duration;
 
@@ -15,9 +15,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 
+use crate::tools::{self, BootstrapEvent, ToolEntry, ToolPaths};
 use crate::updater::{self, InstallEvent, UpdateInfo};
 
-/// インストール処理の段階。
+gpui_kit::actions!([InstallAvailableUpdates]);
+
+/// アプリ本体のインストール処理の段階。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallPhase {
     Downloading { received: u64, total: Option<u64> },
@@ -52,12 +55,13 @@ impl InstallPhase {
     }
 }
 
-/// 更新確認・インストールの状態。
+/// アプリ本体の更新確認・インストールの状態。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateState {
     Idle,
     Checking,
     UpToDate,
+    CheckFailed(String),
     Available(UpdateInfo),
     Installing(InstallPhase),
     Failed(String),
@@ -73,21 +77,129 @@ impl UpdateState {
     }
 }
 
-/// 更新状態を保持し、更新確認・インストールを開始する。
+/// ライブラリのインストール処理の段階。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LibraryInstallPhase {
+    Downloading {
+        tool: String,
+        received: u64,
+        total: Option<u64>,
+        step: usize,
+        steps: usize,
+    },
+    Installing {
+        tool: String,
+        step: usize,
+        steps: usize,
+    },
+}
+
+impl LibraryInstallPhase {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Downloading {
+                tool,
+                received,
+                total,
+                step,
+                steps,
+            } => match total.filter(|total| *total > 0) {
+                Some(total) => format!(
+                    "{tool} をダウンロード {}% ({step}/{steps})",
+                    ((*received as f32 / total as f32) * 100.0).clamp(0.0, 100.0) as u32
+                ),
+                None => format!("{tool} をダウンロード中 ({step}/{steps})"),
+            },
+            Self::Installing { tool, step, steps } => {
+                format!("{tool} を配置中 ({step}/{steps})")
+            }
+        }
+    }
+
+    pub fn percent(&self) -> Option<f32> {
+        match self {
+            Self::Downloading {
+                received, total, ..
+            } => total
+                .filter(|total| *total > 0)
+                .map(|total| ((*received as f32 / total as f32) * 100.0).clamp(0.0, 100.0)),
+            Self::Installing { .. } => None,
+        }
+    }
+
+    pub fn step(&self) -> usize {
+        match self {
+            Self::Downloading { step, .. } | Self::Installing { step, .. } => *step,
+        }
+    }
+}
+
+/// ライブラリの更新確認・インストールの状態。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LibraryUpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    CheckFailed(String),
+    Available(Vec<ToolEntry>),
+    Installing(LibraryInstallPhase),
+    Failed(String),
+}
+
+impl LibraryUpdateState {
+    pub fn is_checking(&self) -> bool {
+        matches!(self, Self::Checking)
+    }
+
+    pub fn is_installing(&self) -> bool {
+        matches!(self, Self::Installing(_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallPlan {
+    None,
+    App,
+    Libraries,
+    LibrariesThenApp,
+}
+
+#[derive(Clone, Debug)]
+struct PreviousUpdateState {
+    app: UpdateState,
+    library: LibraryUpdateState,
+    no_update_visible: bool,
+}
+
+/// 更新状態を保持し、アプリ本体とライブラリの確認・インストールを調整する。
 pub struct UpdateController {
     state: UpdateState,
+    library_state: LibraryUpdateState,
     available: Option<UpdateInfo>,
+    available_tools: Vec<ToolEntry>,
     no_update_visible: bool,
     hide_task: Option<Task<()>>,
+    install_app_after_library: bool,
+    library_background_started: bool,
+    library_check_completed: bool,
+    library_check_unavailable: bool,
+    dialog_plan: Option<InstallPlan>,
 }
 
 impl UpdateController {
     pub fn new() -> Self {
         Self {
             state: UpdateState::Idle,
+            library_state: LibraryUpdateState::Idle,
             available: None,
+            available_tools: Vec::new(),
             no_update_visible: false,
             hide_task: None,
+            install_app_after_library: false,
+            library_background_started: false,
+            library_check_completed: false,
+            library_check_unavailable: false,
+            dialog_plan: None,
         }
     }
 
@@ -95,12 +207,69 @@ impl UpdateController {
         &self.state
     }
 
+    pub fn library_state(&self) -> &LibraryUpdateState {
+        &self.library_state
+    }
+
     pub fn is_checking(&self) -> bool {
         self.state.is_checking()
     }
 
+    pub fn is_library_checking(&self) -> bool {
+        self.library_state.is_checking()
+    }
+
     pub fn is_installing(&self) -> bool {
         self.state.is_installing()
+    }
+
+    pub fn is_library_installing(&self) -> bool {
+        self.library_state.is_installing()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.is_checking()
+            || self.is_library_checking()
+            || self.is_installing()
+            || self.is_library_installing()
+    }
+
+    pub fn has_app_update(&self) -> bool {
+        matches!(self.state, UpdateState::Available(_))
+    }
+
+    pub fn has_library_update(&self) -> bool {
+        matches!(self.library_state, LibraryUpdateState::Available(_))
+    }
+
+    /// タイトルバーの更新ボタンに表示する文案。
+    pub fn available_update_label(&self) -> Option<&'static str> {
+        if (!self.library_check_completed && !self.library_check_unavailable)
+            || matches!(self.state, UpdateState::CheckFailed(_))
+            || (matches!(self.library_state, LibraryUpdateState::CheckFailed(_))
+                && !self.library_check_unavailable)
+        {
+            return None;
+        }
+        Self::label_for(self.has_app_update(), self.has_library_update())
+    }
+
+    fn label_for(app: bool, library: bool) -> Option<&'static str> {
+        match (app, library) {
+            (true, true) => Some("アプリとライブラリの更新が有ります"),
+            (true, false) => Some("アプリの更新が有ります"),
+            (false, true) => Some("ライブラリの更新が有ります"),
+            (false, false) => None,
+        }
+    }
+
+    fn install_plan(&self) -> InstallPlan {
+        match (self.has_app_update(), self.has_library_update()) {
+            (true, true) => InstallPlan::LibrariesThenApp,
+            (true, false) => InstallPlan::App,
+            (false, true) => InstallPlan::Libraries,
+            (false, false) => InstallPlan::None,
+        }
     }
 
     /// 更新なしのタイトルバー表示を出しているか。
@@ -110,46 +279,128 @@ impl UpdateController {
 
     pub fn status_text(&self) -> String {
         match &self.state {
-            UpdateState::Idle => "更新を確認していません。".to_string(),
-            UpdateState::Checking => "更新を確認しています…".to_string(),
-            UpdateState::UpToDate => "お使いのバージョンは最新です。".to_string(),
-            UpdateState::Available(info) => {
-                format!("v{} にアップデートできます。", info.version)
+            UpdateState::Idle => "アプリを確認していません。".to_string(),
+            UpdateState::Checking => "アプリの更新を確認しています…".to_string(),
+            UpdateState::UpToDate => "アプリは最新です。".to_string(),
+            UpdateState::CheckFailed(message) => {
+                format!("アプリの更新を確認できませんでした。{message}")
             }
-            UpdateState::Installing(phase) => format!("インストール中: {}", phase.label()),
+            UpdateState::Available(info) => {
+                format!("アプリを v{} にアップデートできます。", info.version)
+            }
+            UpdateState::Installing(phase) => format!("アプリをインストール中: {}", phase.label()),
             UpdateState::Failed(message) => {
-                format!("インストールに失敗しました。{message}")
+                format!("アプリのインストールに失敗しました。{message}")
             }
         }
     }
 
-    /// 起動時のバックグラウンド確認。ダイアログは表示しない。
+    pub fn library_status_text(&self) -> String {
+        match &self.library_state {
+            LibraryUpdateState::Idle => "ライブラリを確認していません。".to_string(),
+            LibraryUpdateState::Checking => "ライブラリの更新を確認しています…".to_string(),
+            LibraryUpdateState::UpToDate => "ライブラリは最新です。".to_string(),
+            LibraryUpdateState::CheckFailed(message) => {
+                format!("ライブラリの更新を確認できませんでした。{message}")
+            }
+            LibraryUpdateState::Available(entries) => format!(
+                "{} をアップデートできます。",
+                entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ),
+            LibraryUpdateState::Installing(phase) => {
+                format!("ライブラリをインストール中: {}", phase.label())
+            }
+            LibraryUpdateState::Failed(message) => {
+                format!("ライブラリのインストールに失敗しました。{message}")
+            }
+        }
+    }
+
+    /// 起動時のアプリ更新確認。ダイアログは表示しない。
     pub fn check_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.state, UpdateState::Idle) {
-            self.spawn_check(window, cx, false);
+            self.spawn_app_check(window, cx);
         }
     }
 
-    /// メニュー・Aboutからの手動確認。
-    pub fn check_manually(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_installing() || self.is_checking() || window.has_active_dialog(cx) {
+    /// ツール準備完了後のライブラリ更新確認。ダイアログは表示しない。
+    pub fn check_libraries_background(&mut self, cx: &mut Context<Self>) {
+        if self.library_background_started
+            || !matches!(self.library_state, LibraryUpdateState::Idle)
+        {
             return;
         }
-        self.spawn_check(window, cx, true);
+        self.library_background_started = true;
+        self.spawn_library_check(cx);
     }
 
-    fn spawn_check(&mut self, window: &mut Window, cx: &mut Context<Self>, manual: bool) {
-        let previous = self.state.clone();
-        let previous_no_update_visible = self.no_update_visible;
+    /// ツール準備が失敗し、ライブラリ確認を開始できない状態を記録する。
+    pub fn mark_library_check_unavailable(&mut self, cx: &mut Context<Self>) {
+        if self.library_check_completed {
+            return;
+        }
+        self.library_check_completed = true;
+        self.library_check_unavailable = true;
+        self.library_state = LibraryUpdateState::CheckFailed(
+            "ツール準備が完了していないため確認できません。".to_string(),
+        );
+        cx.notify();
+    }
+
+    /// メニュー・Aboutからの手動確認。アプリとライブラリの両方を確認する。
+    pub fn check_manually(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() || window.has_active_dialog(cx) {
+            return;
+        }
+
+        let previous = PreviousUpdateState {
+            app: self.state.clone(),
+            library: self.library_state.clone(),
+            no_update_visible: self.no_update_visible,
+        };
         self.state = UpdateState::Checking;
+        self.library_state = LibraryUpdateState::Checking;
         self.no_update_visible = false;
         self.cancel_hide();
         cx.notify();
 
+        let (app_sender, app_receiver) = smol::channel::unbounded();
+        std::thread::spawn(move || {
+            let _ = app_sender.send_blocking(updater::check_for_update());
+        });
+        let (library_sender, library_receiver) = smol::channel::unbounded();
+        std::thread::spawn(move || {
+            let _ =
+                library_sender.send_blocking(tools::check_for_tool_updates(ToolPaths::from_env()));
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let app_result = app_receiver
+                .recv()
+                .await
+                .unwrap_or_else(|error| Err(format!("アプリの更新確認を中断しました: {error}")));
+            let library_result = library_receiver.recv().await.unwrap_or_else(|error| {
+                Err(format!("ライブラリの更新確認を中断しました: {error}"))
+            });
+            this.update_in(cx, |this, window, cx| {
+                this.finish_manual_check(app_result, library_result, previous, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn spawn_app_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state = UpdateState::Checking;
+        cx.notify();
+
         let (sender, receiver) = smol::channel::unbounded();
         std::thread::spawn(move || {
-            let result = updater::check_for_update();
-            let _ = sender.send_blocking(result);
+            let _ = sender.send_blocking(updater::check_for_update());
         });
 
         cx.spawn_in(window, async move |this, cx| {
@@ -157,104 +408,226 @@ impl UpdateController {
                 .recv()
                 .await
                 .unwrap_or_else(|error| Err(format!("更新確認を中断しました: {error}")));
-            this.update_in(cx, |this, window, cx| {
-                this.finish_check(
-                    result,
-                    manual,
-                    previous,
-                    previous_no_update_visible,
-                    window,
-                    cx,
-                );
+            this.update_in(cx, |this, _, cx| {
+                this.finish_app_background_check(result, cx);
             })
             .ok();
         })
         .detach();
     }
 
-    fn finish_check(
+    fn finish_app_background_check(
         &mut self,
         result: Result<Option<UpdateInfo>, String>,
-        manual: bool,
-        previous: UpdateState,
-        previous_no_update_visible: bool,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match result {
             Ok(Some(info)) => {
                 self.available = Some(info.clone());
-                self.state = UpdateState::Available(info.clone());
-                self.cancel_hide();
-                if manual {
-                    self.open_available_dialog(info, window, cx);
-                }
+                self.state = UpdateState::Available(info);
             }
             Ok(None) => {
                 self.available = None;
-                if manual {
-                    self.state = UpdateState::UpToDate;
-                    self.no_update_visible = true;
-                    self.schedule_hide(cx);
-                    self.open_up_to_date_dialog(window, cx);
-                } else {
-                    self.state = UpdateState::Idle;
-                }
+                self.state = UpdateState::UpToDate;
             }
-            Err(message) => {
-                if manual {
-                    self.state = previous;
-                    self.no_update_visible = previous_no_update_visible;
-                    if matches!(self.state, UpdateState::UpToDate) && previous_no_update_visible {
-                        self.schedule_hide(cx);
-                    }
-                    self.open_error_dialog(
-                        "アップデートを確認できませんでした",
-                        &message,
-                        window,
-                        cx,
-                    );
-                } else {
-                    self.state = UpdateState::Idle;
-                }
-            }
+            Err(message) => self.state = UpdateState::CheckFailed(message),
         }
         cx.notify();
     }
 
-    /// 更新がある状態から、確認ダイアログを開く。
-    pub fn open_available_dialog(
+    fn spawn_library_check(&mut self, cx: &mut Context<Self>) {
+        self.library_state = LibraryUpdateState::Checking;
+        cx.notify();
+
+        let (sender, receiver) = smol::channel::unbounded();
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(tools::check_for_tool_updates(ToolPaths::from_env()));
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = receiver.recv().await.unwrap_or_else(|error| {
+                Err(format!("ライブラリの更新確認を中断しました: {error}"))
+            });
+            this.update(cx, |this, cx| {
+                this.finish_library_background_check(result, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_library_background_check(
         &mut self,
-        info: UpdateInfo,
+        result: Result<Vec<ToolEntry>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.library_check_completed = true;
+        match result {
+            Ok(entries) if entries.is_empty() => {
+                self.available_tools.clear();
+                self.library_state = LibraryUpdateState::UpToDate;
+            }
+            Ok(entries) => {
+                self.available_tools = entries.clone();
+                self.library_state = LibraryUpdateState::Available(entries);
+            }
+            Err(message) => self.library_state = LibraryUpdateState::CheckFailed(message),
+        }
+        cx.notify();
+    }
+
+    fn finish_manual_check(
+        &mut self,
+        app_result: Result<Option<UpdateInfo>, String>,
+        library_result: Result<Vec<ToolEntry>, String>,
+        previous: PreviousUpdateState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if window.has_active_dialog(cx) {
+        self.library_check_completed = true;
+        let mut errors = Vec::new();
+
+        match app_result {
+            Ok(Some(info)) => {
+                self.available = Some(info.clone());
+                self.state = UpdateState::Available(info);
+            }
+            Ok(None) => {
+                self.available = None;
+                self.state = UpdateState::UpToDate;
+            }
+            Err(message) => {
+                self.state = previous.app.clone();
+                errors.push(format!("アプリ: {message}"));
+            }
+        }
+
+        match library_result {
+            Ok(entries) if entries.is_empty() => {
+                self.available_tools.clear();
+                self.library_state = LibraryUpdateState::UpToDate;
+            }
+            Ok(entries) => {
+                self.available_tools = entries.clone();
+                self.library_state = LibraryUpdateState::Available(entries);
+            }
+            Err(message) => {
+                self.library_state = previous.library.clone();
+                errors.push(format!("ライブラリ: {message}"));
+            }
+        }
+
+        if errors.is_empty() && self.available_update_label().is_none() {
+            self.no_update_visible = true;
+            self.schedule_hide(cx);
+            self.open_up_to_date_dialog(window, cx);
+        } else if errors.is_empty() {
+            self.open_available_dialog(window, cx);
+        } else {
+            self.no_update_visible = previous.no_update_visible;
+            if self.no_update_visible
+                && matches!(self.state, UpdateState::UpToDate)
+                && matches!(self.library_state, LibraryUpdateState::UpToDate)
+            {
+                self.schedule_hide(cx);
+            }
+            self.open_error_dialog(
+                "アップデートを確認できませんでした",
+                &errors.join("\n"),
+                window,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// 利用可能な更新を確認ダイアログで表示する。
+    pub fn open_available_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.available_update_label().is_none() {
             return;
         }
-        let controller = cx.entity();
+        self.open_dialog_for_plan(self.install_plan(), window, cx);
+    }
+
+    /// アプリ本体だけの確認ダイアログを表示する。
+    pub fn open_app_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_app_update() {
+            self.open_dialog_for_plan(InstallPlan::App, window, cx);
+        }
+    }
+
+    /// ライブラリだけの確認ダイアログを表示する。
+    pub fn open_library_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_library_update() {
+            self.open_dialog_for_plan(InstallPlan::Libraries, window, cx);
+        }
+    }
+
+    fn open_dialog_for_plan(
+        &mut self,
+        plan: InstallPlan,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if plan == InstallPlan::None || window.has_active_dialog(cx) {
+            return;
+        }
+        self.dialog_plan = Some(plan);
+        let app_info = if matches!(plan, InstallPlan::App | InstallPlan::LibrariesThenApp) {
+            self.available.clone()
+        } else {
+            None
+        };
+        let library_entries =
+            if matches!(plan, InstallPlan::Libraries | InstallPlan::LibrariesThenApp) {
+                self.available_tools.clone()
+            } else {
+                Vec::new()
+            };
 
         window.open_dialog(cx, move |dialog, _, dialog_cx| {
-            let install_controller = controller.clone();
+            let mut details = Vec::new();
+            if let Some(info) = &app_info {
+                details.push(
+                    div()
+                        .text_sm()
+                        .child(format!(
+                            "アプリ: v{} → v{}",
+                            crate::app_settings::APP_VERSION,
+                            info.version
+                        ))
+                        .into_any_element(),
+                );
+            }
+            if !library_entries.is_empty() {
+                let versions = library_entries
+                    .iter()
+                    .map(|entry| format!("{} {}", entry.name, entry.version))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                details.push(div().text_sm().child(format!("ライブラリ: {versions}")).into_any_element());
+            }
+            let description = if app_info.is_some() && !library_entries.is_empty() {
+                "ライブラリを更新した後、アプリを置き換えて再起動します。作業中のダウンロードは中断されます。"
+            } else if app_info.is_some() {
+                "ダウンロード後にアプリを置き換えて再起動します。作業中のダウンロードは中断されます。"
+            } else {
+                "ライブラリを更新します。アプリの再起動は不要です。"
+            };
+
             dialog
                 .title("アップデートが有ります")
-                .width(px(460.))
+                .width(px(520.))
                 .centered()
                 .child(
                     v_flex()
                         .gap_2()
-                        .child(
-                            div()
-                                .text_sm()
-                                .child(format!("v{} が利用可能です。", info.version)),
-                        )
+                        .children(details)
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(dialog_cx.theme().muted_foreground)
-                                .child(
-                                    "ダウンロード後にアプリを置き換えて再起動します。作業中のダウンロードは中断されます。",
-                                ),
+                                .child(description),
                         ),
                 )
                 .footer(
@@ -268,14 +641,15 @@ impl UpdateController {
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
-                            Button::new("install-update")
+                            Button::new("install-available-updates")
                                 .primary()
                                 .label("インストール")
-                                .on_click(move |_, window, cx| {
-                                    install_controller.update(cx, |controller, cx| {
-                                        controller.install(window, cx);
-                                    });
+                                .on_click(|_, window, cx| {
                                     window.close_dialog(cx);
+                                    window.dispatch_action(
+                                        InstallAvailableUpdates.boxed_clone(),
+                                        cx,
+                                    );
                                 }),
                         ),
                 )
@@ -285,9 +659,9 @@ impl UpdateController {
     fn open_up_to_date_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.open_alert_dialog(cx, move |alert, _, _| {
             alert
-                .title("お使いのバージョンは最新です")
+                .title("お使いのアプリとライブラリは最新です")
                 .description(format!(
-                    "現在のバージョンは v{} です。",
+                    "現在のアプリバージョンは v{} です。",
                     crate::app_settings::APP_VERSION
                 ))
                 .show_cancel(false)
@@ -319,8 +693,43 @@ impl UpdateController {
         });
     }
 
-    /// インストールを開始する。失敗後の再実行にも使う。
-    pub fn install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 確認ダイアログから表示時点の更新計画を実行する。
+    pub fn install_dialog_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan) = self.dialog_plan.take() else {
+            return;
+        };
+        self.install_available(plan, window, cx);
+    }
+
+    /// ダイアログ表示時点の更新計画を確認してからまとめて更新する。
+    fn install_available(
+        &mut self,
+        expected: InstallPlan,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_busy() {
+            return;
+        }
+        if self.install_plan() != expected {
+            self.open_available_dialog(window, cx);
+            return;
+        }
+        match expected {
+            InstallPlan::LibrariesThenApp => {
+                self.install_app_after_library = true;
+                self.start_library_install(window, cx);
+            }
+            InstallPlan::Libraries => {
+                self.install_app_after_library = false;
+                self.start_library_install(window, cx);
+            }
+            InstallPlan::App => self.start_app_install(window, cx),
+            InstallPlan::None => {}
+        }
+    }
+
+    fn start_app_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_installing() {
             return;
         }
@@ -338,42 +747,198 @@ impl UpdateController {
         std::thread::spawn(move || updater::install_update(info, sender));
 
         cx.spawn_in(window, async move |this, cx| {
+            let mut terminal_received = false;
             while let Ok(event) = receiver.recv().await {
-                let terminal = matches!(
+                terminal_received = matches!(
                     event,
                     InstallEvent::Installed { .. }
                         | InstallEvent::Revealed { .. }
                         | InstallEvent::Failed(_)
                 );
                 this.update_in(cx, |this, window, cx| {
-                    this.finish_install(event, window, cx);
+                    this.finish_app_install(event, window, cx);
                 })
                 .ok();
-                if terminal {
+                if terminal_received {
                     break;
                 }
+            }
+            if !terminal_received {
+                this.update_in(cx, |this, window, cx| {
+                    this.finish_app_install(
+                        InstallEvent::Failed("アプリの更新処理が途中で終了しました。".to_string()),
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
             }
         })
         .detach();
     }
 
-    /// 失敗後に最初からやり直す。
+    fn start_library_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_library_installing() || self.available_tools.is_empty() {
+            return;
+        }
+        let entries = self.available_tools.clone();
+        self.library_state = LibraryUpdateState::Installing(LibraryInstallPhase::Downloading {
+            tool: entries[0].name.clone(),
+            received: 0,
+            total: None,
+            step: 1,
+            steps: entries.len(),
+        });
+        cx.notify();
+
+        let (sender, receiver) = smol::channel::unbounded();
+        std::thread::spawn(move || {
+            tools::install_tool_updates(ToolPaths::from_env(), entries, sender);
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let mut terminal_received = false;
+            while let Ok(event) = receiver.recv().await {
+                terminal_received =
+                    matches!(event, BootstrapEvent::Ready | BootstrapEvent::Failed(_));
+                this.update_in(cx, |this, window, cx| {
+                    this.finish_library_install(event, window, cx);
+                })
+                .ok();
+                if terminal_received {
+                    break;
+                }
+            }
+            if !terminal_received {
+                this.update_in(cx, |this, window, cx| {
+                    this.finish_library_install(
+                        BootstrapEvent::Failed(
+                            "ライブラリの更新処理が途中で終了しました。".to_string(),
+                        ),
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn remove_completed_library_updates(&mut self) {
+        let completed = match &self.library_state {
+            LibraryUpdateState::Installing(phase) => phase.step().saturating_sub(1),
+            _ => 0,
+        }
+        .min(self.available_tools.len().saturating_sub(1));
+        if completed > 0 {
+            self.available_tools.drain(..completed);
+        }
+    }
+
+    fn finish_library_install(
+        &mut self,
+        event: BootstrapEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            BootstrapEvent::Checking => {}
+            BootstrapEvent::Downloading {
+                tool,
+                received,
+                total,
+                step,
+                steps,
+            } => {
+                self.library_state =
+                    LibraryUpdateState::Installing(LibraryInstallPhase::Downloading {
+                        tool,
+                        received,
+                        total,
+                        step,
+                        steps,
+                    });
+            }
+            BootstrapEvent::Installing { tool, step, steps } => {
+                self.library_state =
+                    LibraryUpdateState::Installing(LibraryInstallPhase::Installing {
+                        tool,
+                        step,
+                        steps,
+                    });
+            }
+            BootstrapEvent::Ready => {
+                self.available_tools.clear();
+                self.library_state = LibraryUpdateState::UpToDate;
+                if self.install_app_after_library {
+                    self.install_app_after_library = false;
+                    self.start_app_install(window, cx);
+                    return;
+                }
+                window.push_notification(Notification::info("ライブラリを更新しました。"), cx);
+            }
+            BootstrapEvent::Failed(message) => {
+                self.remove_completed_library_updates();
+                self.install_app_after_library = false;
+                self.library_state = LibraryUpdateState::Failed(message.clone());
+                self.open_error_dialog("ライブラリの更新に失敗しました", &message, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// アプリ本体の失敗した更新をやり直す。
+    pub fn retry_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() || !matches!(self.state, UpdateState::Failed(_)) {
+            return;
+        }
+        self.start_app_install(window, cx);
+    }
+
+    /// ライブラリの失敗した更新をやり直す。
+    pub fn retry_libraries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() || !matches!(self.library_state, LibraryUpdateState::Failed(_)) {
+            return;
+        }
+        self.install_app_after_library = false;
+        self.start_library_install(window, cx);
+    }
+
+    /// 失敗した更新をやり直す。
     pub fn retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.state, UpdateState::Failed(_)) {
-            self.install(window, cx);
+        if self.is_busy() {
+            return;
+        }
+        if matches!(self.library_state, LibraryUpdateState::Failed(_)) {
+            self.install_app_after_library = self.available.is_some()
+                && matches!(
+                    self.state,
+                    UpdateState::Available(_) | UpdateState::Failed(_)
+                );
+            self.start_library_install(window, cx);
+        } else if matches!(self.state, UpdateState::Failed(_)) {
+            self.start_app_install(window, cx);
         }
     }
 
     /// 「アップデートは有りません」表示を閉じる。
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.state, UpdateState::UpToDate) {
+        if matches!(self.state, UpdateState::UpToDate)
+            && matches!(self.library_state, LibraryUpdateState::UpToDate)
+        {
             self.no_update_visible = false;
             self.cancel_hide();
             cx.notify();
         }
     }
 
-    fn finish_install(&mut self, event: InstallEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn finish_app_install(
+        &mut self,
+        event: InstallEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             InstallEvent::Downloading { received, total } => {
                 self.state = UpdateState::Installing(InstallPhase::Downloading { received, total });
@@ -416,7 +981,9 @@ impl UpdateController {
         self.hide_task = Some(cx.spawn(async move |this, cx| {
             smol::Timer::after(Duration::from_secs(10)).await;
             this.update(cx, |this, cx| {
-                if matches!(this.state, UpdateState::UpToDate) {
+                if matches!(this.state, UpdateState::UpToDate)
+                    && matches!(this.library_state, LibraryUpdateState::UpToDate)
+                {
                     this.no_update_visible = false;
                     cx.notify();
                 }
@@ -432,7 +999,11 @@ impl UpdateController {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstallPhase, UpdateController, UpdateState};
+    use super::{
+        InstallPhase, InstallPlan, LibraryInstallPhase, LibraryUpdateState, UpdateController,
+        UpdateState,
+    };
+    use crate::tools::ToolEntry;
     use crate::updater::UpdateInfo;
 
     fn info() -> UpdateInfo {
@@ -440,6 +1011,17 @@ mod tests {
             version: "0.2.0".to_string(),
             url: "https://example.com/app.zip".to_string(),
             sha256: "a".repeat(64),
+        }
+    }
+
+    fn tool(name: &str) -> ToolEntry {
+        ToolEntry {
+            name: name.to_string(),
+            version: "2026.11.26".to_string(),
+            platform: "macos-aarch64".to_string(),
+            url: format!("https://example.com/{name}.zip"),
+            sha256: "a".repeat(64),
+            required: true,
         }
     }
 
@@ -461,6 +1043,19 @@ mod tests {
     }
 
     #[test]
+    fn formats_library_download_phase() {
+        let phase = LibraryInstallPhase::Downloading {
+            tool: "yt-dlp".to_string(),
+            received: 50,
+            total: Some(100),
+            step: 1,
+            steps: 2,
+        };
+        assert_eq!(phase.label(), "yt-dlp をダウンロード 50% (1/2)");
+        assert_eq!(phase.percent(), Some(50.0));
+    }
+
+    #[test]
     fn reports_installing_only_for_the_install_state() {
         let mut controller = UpdateController::new();
         assert!(!controller.is_installing());
@@ -472,10 +1067,114 @@ mod tests {
     fn shows_the_available_version() {
         let controller = UpdateController {
             state: UpdateState::Available(info()),
+            library_state: super::LibraryUpdateState::Idle,
             available: Some(info()),
+            available_tools: Vec::new(),
             no_update_visible: false,
             hide_task: None,
+            install_app_after_library: false,
+            library_background_started: false,
+            library_check_completed: false,
+            library_check_unavailable: false,
+            dialog_plan: None,
         };
         assert!(controller.status_text().contains("0.2.0"));
+    }
+
+    #[test]
+    fn labels_each_available_update_combination() {
+        assert_eq!(
+            UpdateController::label_for(true, true),
+            Some("アプリとライブラリの更新が有ります")
+        );
+        assert_eq!(
+            UpdateController::label_for(true, false),
+            Some("アプリの更新が有ります")
+        );
+        assert_eq!(
+            UpdateController::label_for(false, true),
+            Some("ライブラリの更新が有ります")
+        );
+        assert_eq!(UpdateController::label_for(false, false), None);
+    }
+
+    #[test]
+    fn plans_libraries_before_the_app_when_both_are_available() {
+        let mut controller = UpdateController::new();
+        controller.state = UpdateState::Available(info());
+        controller.available = Some(info());
+        let entry = tool("yt-dlp");
+        controller.library_state = LibraryUpdateState::Available(vec![entry.clone()]);
+
+        assert_eq!(controller.install_plan(), InstallPlan::LibrariesThenApp);
+
+        controller.library_state = LibraryUpdateState::UpToDate;
+        assert_eq!(controller.install_plan(), InstallPlan::App);
+
+        controller.state = UpdateState::UpToDate;
+        controller.library_state = LibraryUpdateState::Available(vec![entry]);
+        assert_eq!(controller.install_plan(), InstallPlan::Libraries);
+
+        controller.library_state = LibraryUpdateState::UpToDate;
+        assert_eq!(controller.install_plan(), InstallPlan::None);
+    }
+
+    #[test]
+    fn suppresses_the_update_button_until_both_checks_succeed() {
+        let mut controller = UpdateController::new();
+        controller.state = UpdateState::Available(info());
+        controller.available = Some(info());
+
+        assert_eq!(controller.available_update_label(), None);
+
+        controller.library_check_completed = true;
+        assert_eq!(
+            controller.available_update_label(),
+            Some("アプリの更新が有ります")
+        );
+
+        controller.library_state = LibraryUpdateState::CheckFailed("offline".to_string());
+        assert_eq!(controller.available_update_label(), None);
+
+        controller.library_check_unavailable = true;
+        assert_eq!(
+            controller.available_update_label(),
+            Some("アプリの更新が有ります")
+        );
+
+        controller.library_check_unavailable = false;
+        controller.library_state = LibraryUpdateState::UpToDate;
+        controller.state = UpdateState::CheckFailed("offline".to_string());
+        assert_eq!(controller.available_update_label(), None);
+    }
+
+    #[test]
+    fn retries_only_the_library_that_failed_after_a_partial_success() {
+        let mut controller = UpdateController::new();
+        controller.available_tools = vec![tool("yt-dlp"), tool("ffmpeg")];
+        controller.library_state =
+            LibraryUpdateState::Installing(LibraryInstallPhase::Downloading {
+                tool: "ffmpeg".to_string(),
+                received: 0,
+                total: None,
+                step: 2,
+                steps: 2,
+            });
+
+        controller.remove_completed_library_updates();
+
+        assert_eq!(controller.available_tools.len(), 1);
+        assert_eq!(controller.available_tools[0].name, "ffmpeg");
+    }
+
+    #[test]
+    fn treats_either_update_as_busy() {
+        let mut controller = UpdateController::new();
+        controller.library_state = LibraryUpdateState::Checking;
+        assert!(controller.is_busy());
+
+        controller.library_state = LibraryUpdateState::Idle;
+        controller.state = UpdateState::Checking;
+        assert!(controller.is_busy());
     }
 }
