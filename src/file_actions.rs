@@ -21,7 +21,7 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
 pub(crate) fn open_output_file(path: &str) -> Result<(), String> {
     let path = expand_path(path);
     if !path.is_file() {
-        return Err("ファイルが見つかりません".to_string());
+        return Err(format!("ファイルが見つかりません: {}", path.display()));
     }
 
     open_with_default_app(&path, "ファイルを開けませんでした")
@@ -30,7 +30,10 @@ pub(crate) fn open_output_file(path: &str) -> Result<(), String> {
 pub(crate) fn open_output_folder(path: &str) -> Result<(), String> {
     let path = expand_path(path);
     if !path.is_dir() {
-        return Err("保存先フォルダが見つかりません".to_string());
+        return Err(format!(
+            "保存先フォルダが見つかりません: {}",
+            path.display()
+        ));
     }
 
     open_with_default_app(&path, "保存先を開けませんでした")
@@ -40,9 +43,14 @@ fn open_with_default_app(path: &Path, error_prefix: &str) -> Result<(), String> 
     let mut child = Command::new("/usr/bin/open")
         .arg(path)
         .spawn()
-        .map_err(|error| format!("{error_prefix}: {error}"))?;
+        .map_err(|error| format!("{error_prefix} ({}): {error}", path.display()))?;
+    let path = path.display().to_string();
     thread::spawn(move || {
-        let _ = child.wait();
+        if let Ok(status) = child.wait()
+            && !status.success()
+        {
+            eprintln!("failed to open {path}: {status}");
+        }
     });
     Ok(())
 }

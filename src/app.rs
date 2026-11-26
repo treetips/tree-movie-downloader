@@ -30,7 +30,7 @@ use crate::app_settings::{APP_VERSION, WallpaperSource};
 use crate::downloader::DownloadManager;
 use crate::model::{
     AudioQuality, Container, DEFAULT_AUDIO, DEFAULT_AUDIO_CONTAINER, DEFAULT_CONTAINER,
-    DEFAULT_QUALITY, Quality, QueueEvent, QueueModel,
+    DEFAULT_QUALITY, Quality, QueueEvent, QueueModel, container_index, resolve_container,
 };
 use crate::queue_table::render_queue;
 use crate::quick_download::{QuickDownloadEvent, QuickDownloadView};
@@ -139,8 +139,15 @@ impl AppView {
             page.restart_wallpaper_shuffle(window, cx);
         });
         let downloads = cx.new(|_| DownloadManager::new(queue.clone()));
-        let quick_download =
-            cx.new(|cx| QuickDownloadView::new(queue.clone(), downloads.clone(), window, cx));
+        let quick_download = cx.new(|cx| {
+            QuickDownloadView::new(
+                queue.clone(),
+                downloads.clone(),
+                update_controller.clone(),
+                window,
+                cx,
+            )
+        });
         let quick_subscription = cx.subscribe(&quick_download, |this, _, event, cx| {
             match event {
                 QuickDownloadEvent::OpenBatch => this.page = Page::Batch,
@@ -608,11 +615,6 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let options = Container::options_for(quality);
-        let fallback = if quality == Quality::AudioOnly {
-            DEFAULT_AUDIO_CONTAINER
-        } else {
-            DEFAULT_CONTAINER
-        };
         let settings_container = self.queue.read(cx).settings().container();
 
         let current = if reset {
@@ -626,14 +628,7 @@ impl AppView {
                     .find(|container| container.label() == label)
             })
         };
-        let selected_container = current
-            .filter(|container| options.contains(container))
-            .or_else(|| {
-                options
-                    .contains(&settings_container)
-                    .then_some(settings_container)
-            })
-            .unwrap_or(fallback);
+        let selected_container = resolve_container(quality, current, settings_container);
         let selected = options
             .iter()
             .position(|container| *container == selected_container)
@@ -787,10 +782,8 @@ impl AppView {
             )
     }
 
-    fn render_quick_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let updating = self.is_updating(cx);
-        self.quick_download
-            .update(cx, |view, cx| view.render_page(updating, cx))
+    fn render_quick_page(&self, _: &mut Context<Self>) -> AnyElement {
+        self.quick_download.clone().into_any_element()
     }
 
     fn render_about_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1664,14 +1657,6 @@ fn render_empty_queue(cx: &mut Context<AppView>) -> impl IntoElement {
                 .label("URLを追加")
                 .on_click(cx.listener(|this, _, window, cx| this.open_add_urls_dialog(window, cx))),
         )
-}
-
-fn container_index(options: &[Container], selected: Container, fallback: Container) -> usize {
-    options
-        .iter()
-        .position(|container| *container == selected)
-        .or_else(|| options.iter().position(|container| *container == fallback))
-        .unwrap_or(0)
 }
 
 fn format_bytes(value: u64) -> String {

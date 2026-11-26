@@ -191,6 +191,35 @@ pub const DEFAULT_CONTAINER: Container = Container::Mkv;
 /// `映像なし` を選んだときの音声用コンテナの初期値。
 pub const DEFAULT_AUDIO_CONTAINER: Container = Container::M4a;
 
+pub fn resolve_container(
+    quality: Quality,
+    current: Option<Container>,
+    settings_container: Container,
+) -> Container {
+    let options = Container::options_for(quality);
+    let fallback = if quality == Quality::AudioOnly {
+        DEFAULT_AUDIO_CONTAINER
+    } else {
+        DEFAULT_CONTAINER
+    };
+    current
+        .filter(|container| options.contains(container))
+        .or_else(|| {
+            options
+                .contains(&settings_container)
+                .then_some(settings_container)
+        })
+        .unwrap_or(fallback)
+}
+
+pub fn container_index(options: &[Container], selected: Container, fallback: Container) -> usize {
+    options
+        .iter()
+        .position(|container| *container == selected)
+        .or_else(|| options.iter().position(|container| *container == fallback))
+        .unwrap_or(0)
+}
+
 /// 自動リトライ回数の選択肢。
 pub const RETRY_CHOICES: [usize; 3] = [1, 3, 5];
 pub const RETRY_LABELS: [&str; 3] = ["1回", "3回", "5回"];
@@ -357,8 +386,8 @@ impl QueueItem {
             destination: destination.into(),
             status: ItemStatus::Queued,
             progress: 0.0,
-            downloaded: "—".into(),
-            total: "—".into(),
+            downloaded: UNKNOWN_PROGRESS.into(),
+            total: UNKNOWN_PROGRESS.into(),
             eta: None,
             quality,
             audio,
@@ -466,11 +495,11 @@ impl QueueItem {
     }
 
     pub fn is_total_unknown(&self) -> bool {
-        self.total.as_ref() == "—"
+        self.total.as_ref() == UNKNOWN_PROGRESS
     }
 
     pub fn is_downloaded_unknown(&self) -> bool {
-        self.downloaded.as_ref() == "—"
+        self.downloaded.as_ref() == UNKNOWN_PROGRESS
     }
 }
 
@@ -523,12 +552,15 @@ pub enum QueueEvent {
 
 const LOG_LIMIT: usize = 200;
 const LOG_URL_LIMIT: usize = 64;
+const UNKNOWN_PROGRESS: &str = "—";
 
 fn is_http_url(url: &str) -> bool {
-    url.split_once("://").is_some_and(|(scheme, rest)| {
-        !rest.is_empty()
-            && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-    })
+    !url.chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\\')
+        && url.split_once("://").is_some_and(|(scheme, rest)| {
+            !rest.is_empty()
+                && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        })
 }
 
 /// 表に出すためのURL表記。スキームと `www.` を省いて識別しやすくする。
@@ -614,7 +646,7 @@ impl QueueModel {
                 Container::Mkv,
                 default_downloads_dir(),
             )
-            .with_status(ItemStatus::Skipped, 0.0, "—", "—"),
+            .with_status(ItemStatus::Skipped, 0.0, UNKNOWN_PROGRESS, UNKNOWN_PROGRESS),
             QueueItem::new(
                 4,
                 "https://x.com/example/status/1840000000000000000",
@@ -632,7 +664,7 @@ impl QueueModel {
                 Container::Mkv,
                 default_downloads_dir(),
             )
-            .with_status(ItemStatus::Skipped, 0.0, "—", "—"),
+            .with_status(ItemStatus::Skipped, 0.0, UNKNOWN_PROGRESS, UNKNOWN_PROGRESS),
             QueueItem::new(
                 6,
                 "https://www.twitch.tv/videos/2233445566",
@@ -669,7 +701,7 @@ impl QueueModel {
                 Container::Webm,
                 default_downloads_dir(),
             )
-            .with_status(ItemStatus::Skipped, 0.0, "—", "—"),
+            .with_status(ItemStatus::Skipped, 0.0, UNKNOWN_PROGRESS, UNKNOWN_PROGRESS),
         ];
 
         let mut model = Self {
@@ -1050,20 +1082,12 @@ impl QueueModel {
             .filter(|line| is_http_url(line))
             .collect();
         let container = container.for_quality(quality);
-        let destination = if destination.trim().is_empty() {
-            self.default_destination()
-        } else {
-            destination.to_string()
-        };
 
         let mut added = 0;
         let mut added_sites = Vec::new();
         for url in urls {
-            let id = self.next_id;
-            self.next_id += 1;
-            let item = QueueItem::new(id, url, quality, audio, container, destination.clone());
-            added_sites.push(item.site);
-            self.items.push(item);
+            let (_, site) = self.push_url(url, quality, audio, container, destination, false);
+            added_sites.push(site);
             added += 1;
         }
 
@@ -1099,16 +1123,7 @@ impl QueueModel {
             return None;
         }
         let container = container.for_quality(quality);
-        let destination = if destination.trim().is_empty() {
-            self.default_destination()
-        } else {
-            destination.to_string()
-        };
-        let id = self.next_id;
-        self.next_id += 1;
-        let item = QueueItem::new(id, url, quality, audio, container, destination).single();
-        let site = item.site;
-        self.items.push(item);
+        let (id, site) = self.push_url(url, quality, audio, container, destination, true);
         self.push_log_for_site(
             site,
             LogLevel::Info,
@@ -1122,12 +1137,37 @@ impl QueueModel {
         Some(id)
     }
 
+    fn push_url(
+        &mut self,
+        url: &str,
+        quality: Quality,
+        audio: AudioQuality,
+        container: Container,
+        destination: &str,
+        single_item: bool,
+    ) -> (u64, Site) {
+        let destination = if destination.trim().is_empty() {
+            self.default_destination()
+        } else {
+            destination.to_string()
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut item = QueueItem::new(id, url, quality, audio, container, destination);
+        if single_item {
+            item = item.single();
+        }
+        let site = item.site;
+        self.items.push(item);
+        (id, site)
+    }
+
     /// サイトの次に実行する項目を取得し、取得中に切り替える。
     pub fn take_next_for_site(&mut self, site: Site) -> Option<QueueItem> {
         let index = self.items.iter().position(|item| {
             item.site == site && matches!(item.status, ItemStatus::Paused | ItemStatus::Queued)
         })?;
-        self.take_at(index)
+        Some(self.take_at(index))
     }
 
     /// 指定した項目を取得中に切り替える。ほかのサイトや項目は変更しない。
@@ -1137,17 +1177,17 @@ impl QueueModel {
                 && item.site == site
                 && matches!(item.status, ItemStatus::Paused | ItemStatus::Queued)
         })?;
-        self.take_at(index)
+        Some(self.take_at(index))
     }
 
-    fn take_at(&mut self, index: usize) -> Option<QueueItem> {
+    fn take_at(&mut self, index: usize) -> QueueItem {
         let item = &mut self.items[index];
         item.status = ItemStatus::Downloading;
         item.progress = 0.0;
         item.error = None;
         item.eta = None;
-        item.downloaded = "—".into();
-        item.total = "—".into();
+        item.downloaded = UNKNOWN_PROGRESS.into();
+        item.total = UNKNOWN_PROGRESS.into();
         let url = compact_url(&item.url);
         let item = item.clone();
         self.push_log_for_site(
@@ -1155,7 +1195,7 @@ impl QueueModel {
             LogLevel::Info,
             format!("{url} の取得を開始しました"),
         );
-        Some(item)
+        item
     }
 
     pub fn pause_site(&mut self, site: Site) {
@@ -1188,7 +1228,7 @@ impl QueueModel {
             item.status = ItemStatus::Completed;
             item.progress = 100.0;
             item.eta = None;
-            if item.total == "—" {
+            if item.total == UNKNOWN_PROGRESS {
                 item.downloaded = "完了".into();
             } else {
                 item.downloaded = item.total.clone();
@@ -1249,8 +1289,8 @@ impl QueueModel {
             item.attempts = 0;
             item.error = None;
             item.output_path = None;
-            item.downloaded = "—".into();
-            item.total = "—".into();
+            item.downloaded = UNKNOWN_PROGRESS.into();
+            item.total = UNKNOWN_PROGRESS.into();
             Some((site, compact_url(&item.url)))
         } else {
             None
@@ -1273,8 +1313,8 @@ impl QueueModel {
                 item.attempts = 0;
                 item.error = None;
                 item.output_path = None;
-                item.downloaded = "—".into();
-                item.total = "—".into();
+                item.downloaded = UNKNOWN_PROGRESS.into();
+                item.total = UNKNOWN_PROGRESS.into();
                 retried += 1;
             }
         }
@@ -1296,8 +1336,8 @@ impl QueueModel {
                 item.attempts = 0;
                 item.error = None;
                 item.output_path = None;
-                item.downloaded = "—".into();
-                item.total = "—".into();
+                item.downloaded = UNKNOWN_PROGRESS.into();
+                item.total = UNKNOWN_PROGRESS.into();
                 retried += 1;
             }
         }
@@ -1368,8 +1408,8 @@ impl QueueModel {
         item.eta = None;
         item.error = None;
         item.output_path = Some(path.into());
-        item.downloaded = "—".into();
-        item.total = "—".into();
+        item.downloaded = UNKNOWN_PROGRESS.into();
+        item.total = UNKNOWN_PROGRESS.into();
         let site = item.site;
         let url = compact_url(&item.url);
         self.push_log_for_site(
@@ -1546,6 +1586,8 @@ mod tests {
             "example.com/video",
             "ftp://example.com/video",
             "https://",
+            "https://example.com/a b",
+            "https://example.com/a\nhttps://example.com/b",
         ] {
             assert!(
                 model

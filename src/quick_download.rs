@@ -4,7 +4,7 @@ use std::path::Path;
 
 use gpui_kit::AppContext as _;
 use gpui_kit::Focusable as _;
-use gpui_kit::IntoElement as _;
+use gpui_kit::IntoElement;
 use gpui_kit::ParentElement as _;
 use gpui_kit::Styled as _;
 use gpui_kit::assets::IconName;
@@ -21,15 +21,17 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{Context, Entity, EventEmitter, SharedString, Subscription, Window, div};
+use gpui_kit::{Context, Entity, EventEmitter, Render, SharedString, Subscription, Window, div};
 
 use crate::downloader::DownloadManager;
 use crate::file_actions::{open_output_file, open_output_folder};
 use crate::model::{
     AudioQuality, Container, DEFAULT_AUDIO, DEFAULT_AUDIO_CONTAINER, DEFAULT_CONTAINER,
     DEFAULT_QUALITY, ItemStatus, Quality, QueueEvent, QueueItem, QueueModel, compact_url,
+    container_index, resolve_container,
 };
 use crate::quick_url::{QuickUrlError, validate_quick_url};
+use crate::update_controller::UpdateController;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QuickDownloadEvent {
@@ -44,6 +46,7 @@ enum QuickAction {
     Start,
     Cancel,
     Retry,
+    Resume,
 }
 
 impl QuickAction {
@@ -52,6 +55,7 @@ impl QuickAction {
             Self::Start => "ダウンロード",
             Self::Cancel => "キャンセル",
             Self::Retry => "再試行",
+            Self::Resume => "開始",
         }
     }
 }
@@ -59,6 +63,7 @@ impl QuickAction {
 pub struct QuickDownloadView {
     queue: Entity<QueueModel>,
     downloads: Entity<DownloadManager>,
+    updates: Entity<UpdateController>,
     url_input: Entity<InputState>,
     destination: Entity<SelectState<Vec<SharedString>>>,
     quality: Entity<SelectState<Vec<&'static str>>>,
@@ -76,6 +81,7 @@ impl QuickDownloadView {
     pub fn new(
         queue: Entity<QueueModel>,
         downloads: Entity<DownloadManager>,
+        updates: Entity<UpdateController>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -107,25 +113,20 @@ impl QuickDownloadView {
             )
         });
         let settings_container = queue.read(cx).settings().container();
-        let container_index = Container::VIDEO
-            .iter()
-            .position(|container| *container == settings_container)
-            .unwrap_or_else(|| {
-                Container::VIDEO
-                    .iter()
-                    .position(|container| *container == DEFAULT_CONTAINER)
-                    .unwrap_or(0)
-            });
+        let selected_container_index =
+            container_index(&Container::VIDEO, settings_container, DEFAULT_CONTAINER);
         let container = cx.new(|cx| {
             SelectState::new(
                 Container::VIDEO.map(Container::label).to_vec(),
-                Some(IndexPath::new(container_index)),
+                Some(IndexPath::new(selected_container_index)),
                 window,
                 cx,
             )
         });
 
         let queue_subscription = cx.observe(&queue, |_, _, cx| cx.notify());
+        let updates = updates.clone();
+        let update_subscription = cx.observe(&updates, |_, _, cx| cx.notify());
         let input_subscription =
             cx.subscribe_in(&url_input, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -154,6 +155,7 @@ impl QuickDownloadView {
         Self {
             queue,
             downloads,
+            updates,
             url_input,
             destination,
             quality,
@@ -164,7 +166,12 @@ impl QuickDownloadView {
             job_id: None,
             validation_error: None,
             action_error: None,
-            _subscriptions: vec![queue_subscription, input_subscription, quality_subscription],
+            _subscriptions: vec![
+                queue_subscription,
+                update_subscription,
+                input_subscription,
+                quality_subscription,
+            ],
         }
     }
 
@@ -206,10 +213,12 @@ impl QuickDownloadView {
             return QuickAction::Cancel;
         }
         let url = self.url_input.read(cx).value();
-        if matches!(job.status(), ItemStatus::Failed | ItemStatus::Paused)
-            && job.url().as_ref() == url.trim()
-        {
-            QuickAction::Retry
+        if job.url().as_ref() == url.trim() {
+            match job.status() {
+                ItemStatus::Queued => QuickAction::Resume,
+                ItemStatus::Failed | ItemStatus::Paused => QuickAction::Retry,
+                _ => QuickAction::Start,
+            }
         } else {
             QuickAction::Start
         }
@@ -226,7 +235,7 @@ impl QuickDownloadView {
                 self.action_error = None;
                 cx.notify();
             }
-            QuickAction::Retry => self.retry_current(updating, cx),
+            QuickAction::Retry | QuickAction::Resume => self.retry_current(updating, cx),
             QuickAction::Start => self.start(updating, cx),
         }
     }
@@ -235,10 +244,12 @@ impl QuickDownloadView {
         let Some(id) = self.job_id else {
             return;
         };
-        let retryable =
-            self.queue.read(cx).item(id).is_some_and(|item| {
-                matches!(item.status(), ItemStatus::Failed | ItemStatus::Paused)
-            });
+        let retryable = self.queue.read(cx).item(id).is_some_and(|item| {
+            matches!(
+                item.status(),
+                ItemStatus::Queued | ItemStatus::Failed | ItemStatus::Paused
+            )
+        });
         if !retryable {
             return;
         }
@@ -258,7 +269,7 @@ impl QuickDownloadView {
             .update(cx, |manager, cx| manager.start_item(id, cx))
         {
             self.action_error =
-                Some("再試行を開始できませんでした。一括ダウンロードから開始してください。".into());
+                Some("開始できませんでした。一括ダウンロードから開始してください。".into());
         }
         self.error_expanded = false;
         cx.notify();
@@ -343,11 +354,6 @@ impl QuickDownloadView {
 
     fn sync_container(&mut self, quality: Quality, window: &mut Window, cx: &mut Context<Self>) {
         let options = Container::options_for(quality);
-        let fallback = if quality == Quality::AudioOnly {
-            DEFAULT_AUDIO_CONTAINER
-        } else {
-            DEFAULT_CONTAINER
-        };
         let settings_container = self.queue.read(cx).settings().container();
         let current = self
             .container
@@ -360,14 +366,7 @@ impl QuickDownloadView {
                     .copied()
                     .find(|container| container.label() == label)
             });
-        let selected = current
-            .filter(|container| options.contains(container))
-            .or_else(|| {
-                options
-                    .contains(&settings_container)
-                    .then_some(settings_container)
-            })
-            .unwrap_or(fallback);
+        let selected = resolve_container(quality, current, settings_container);
         let selected = options
             .iter()
             .position(|container| *container == selected)
@@ -379,15 +378,17 @@ impl QuickDownloadView {
         });
     }
 
-    pub fn render_page(&mut self, updating: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_page(&self, updating: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let job = self.current_job(cx);
         let busy = job
             .as_ref()
             .is_some_and(|item| item.status() == ItemStatus::Downloading);
         let input_url = self.url_input.read(cx).value();
         let retrying_same_url = job.as_ref().is_some_and(|item| {
-            matches!(item.status(), ItemStatus::Failed | ItemStatus::Paused)
-                && item.url().as_ref() == input_url.trim()
+            matches!(
+                item.status(),
+                ItemStatus::Queued | ItemStatus::Failed | ItemStatus::Paused
+            ) && item.url().as_ref() == input_url.trim()
         });
         let settings_disabled = busy || retrying_same_url;
         let other_running = !busy && self.queue.read(cx).active_item().is_some();
@@ -586,11 +587,7 @@ impl QuickDownloadView {
             .into_any_element()
     }
 
-    fn render_job(
-        &mut self,
-        job: Option<&QueueItem>,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
+    fn render_job(&self, job: Option<&QueueItem>, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let Some(job) = job else {
             return v_flex()
                 .p_4()
@@ -759,6 +756,16 @@ impl QuickDownloadView {
     }
 }
 
+impl Render for QuickDownloadView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let updating = {
+            let updates = self.updates.read(cx);
+            updates.is_installing() || updates.is_library_installing()
+        };
+        self.render_page(updating, cx)
+    }
+}
+
 fn status_color(status: ItemStatus, cx: &gpui_kit::App) -> gpui_kit::Hsla {
     match status {
         ItemStatus::Completed => cx.theme().success,
@@ -835,6 +842,7 @@ mod tests {
         assert_eq!(QuickAction::Start.label(), "ダウンロード");
         assert_eq!(QuickAction::Cancel.label(), "キャンセル");
         assert_eq!(QuickAction::Retry.label(), "再試行");
+        assert_eq!(QuickAction::Resume.label(), "開始");
     }
 
     #[test]

@@ -256,7 +256,7 @@ impl DownloadManager {
         });
 
         let queue = self.queue.clone();
-        let continue_site = id.is_none() || !task.single_item;
+        let continue_site = id.is_none();
         let manager = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let mut should_start_next = false;
@@ -411,7 +411,9 @@ fn apply_single_item_args(command: &mut Command, task: &DownloadTask) {
         command.arg("--no-playlist");
     }
     if task.single_item {
-        command.arg("--playlist-items").arg("1");
+        command
+            .arg("--playlist-items")
+            .arg(playlist_items_arg(task));
     }
 }
 
