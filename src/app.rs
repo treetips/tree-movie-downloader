@@ -33,6 +33,7 @@ use crate::model::{
     DEFAULT_QUALITY, Quality, QueueEvent, QueueModel,
 };
 use crate::queue_table::render_queue;
+use crate::quick_download::{QuickDownloadEvent, QuickDownloadView};
 use crate::settings_page::SettingsPage;
 use crate::tool_bootstrap::{BootstrapPhase, ToolBootstrap};
 use crate::tools;
@@ -57,6 +58,7 @@ pub struct AppView {
     update_controller: Entity<UpdateController>,
     queue: Entity<QueueModel>,
     downloads: Entity<DownloadManager>,
+    quick_download: Entity<QuickDownloadView>,
     wallpaper: Entity<WallpaperState>,
     settings_page: Entity<SettingsPage>,
     url_input: Entity<TextareaState>,
@@ -137,6 +139,15 @@ impl AppView {
             page.restart_wallpaper_shuffle(window, cx);
         });
         let downloads = cx.new(|_| DownloadManager::new(queue.clone()));
+        let quick_download =
+            cx.new(|cx| QuickDownloadView::new(queue.clone(), downloads.clone(), window, cx));
+        let quick_subscription = cx.subscribe(&quick_download, |this, _, event, cx| {
+            match event {
+                QuickDownloadEvent::OpenBatch => this.page = Page::Batch,
+                QuickDownloadEvent::OpenSettings => this.page = Page::Settings,
+            }
+            cx.notify();
+        });
         let settings_container = queue.read(cx).settings().container();
         let video_container_index =
             container_index(&Container::VIDEO, settings_container, DEFAULT_CONTAINER);
@@ -199,6 +210,7 @@ impl AppView {
             update_controller,
             queue,
             downloads,
+            quick_download,
             wallpaper,
             settings_page,
             url_input,
@@ -220,6 +232,7 @@ impl AppView {
                 appearance_subscription,
                 wallpaper_subscription,
                 downloads_subscription,
+                quick_subscription,
                 bootstrap_subscription,
                 update_subscription,
             ],
@@ -312,11 +325,17 @@ impl AppView {
     }
 
     fn toggle_running(&mut self, cx: &mut Context<Self>) {
-        if self.is_updating(cx) {
+        let updating = self.is_updating(cx);
+        if updating {
             return;
         }
-        self.downloads
-            .update(cx, |manager, cx| manager.toggle_all(cx));
+        if self.page == Page::Quick {
+            self.quick_download
+                .update(cx, |view, cx| view.start_or_cancel(false, cx));
+        } else {
+            self.downloads
+                .update(cx, |manager, cx| manager.toggle_all(cx));
+        }
     }
 
     /// 待機中・一時停止の項目をすべて開始する。
@@ -329,6 +348,12 @@ impl AppView {
     }
 
     fn retry_failed(&mut self, cx: &mut Context<Self>) {
+        if self.page == Page::Quick {
+            let updating = self.is_updating(cx);
+            self.quick_download
+                .update(cx, |view, cx| view.retry_current(updating, cx));
+            return;
+        }
         if self.running {
             return;
         }
@@ -723,12 +748,22 @@ impl AppView {
             } else {
                 label.to_string()
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.page != target {
-                    this.page = target;
-                    cx.notify();
-                }
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_page(target, window, cx);
             }))
+    }
+
+    fn open_page(&mut self, target: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page != target {
+            self.page = target;
+            cx.notify();
+        }
+        if target == Page::Quick {
+            self.quick_download.update(cx, |view, cx| {
+                view.sync_destinations(window, cx);
+                view.focus_url(window, cx);
+            });
+        }
     }
 
     fn render_batch_page(
@@ -751,37 +786,10 @@ impl AppView {
             )
     }
 
-    fn render_quick_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .child(
-                Icon::new(IconName::Zap)
-                    .size_10()
-                    .text_color(cx.theme().muted_foreground),
-            )
-            .child(
-                div()
-                    .text_lg()
-                    .font_semibold()
-                    .child("かんたんダウンロード"),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("URLを貼り付けてすぐにダウンロードする画面は未実装です。"),
-            )
-            .child(
-                Button::new("open-batch")
-                    .label("一括ダウンロードを開く")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.page = Page::Batch;
-                        cx.notify();
-                    })),
-            )
+    fn render_quick_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let updating = self.is_updating(cx);
+        self.quick_download
+            .update(cx, |view, cx| view.render_page(updating, cx))
     }
 
     fn render_about_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1720,7 +1728,7 @@ impl Render for AppView {
             Page::Batch => self
                 .render_batch_page(total, completed, overall, empty, finished, cx)
                 .into_any_element(),
-            Page::Quick => self.render_quick_page(cx).into_any_element(),
+            Page::Quick => self.render_quick_page(cx),
             Page::Settings => self.settings_page.clone().into_any_element(),
             Page::About => self.render_about_page(cx).into_any_element(),
         };
@@ -1801,11 +1809,16 @@ impl Render for AppView {
                     return;
                 }
                 if !window.has_active_dialog(cx) {
-                    if this.page != Page::Batch {
-                        this.page = Page::Batch;
-                        cx.notify();
+                    if this.page == Page::Quick {
+                        this.quick_download
+                            .update(cx, |view, cx| view.focus_url(window, cx));
+                    } else {
+                        if this.page != Page::Batch {
+                            this.page = Page::Batch;
+                            cx.notify();
+                        }
+                        this.open_add_urls_dialog(window, cx);
                     }
-                    this.open_add_urls_dialog(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &StartOrPause, window, cx| {

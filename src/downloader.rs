@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui_kit::{Context, Entity, SharedString};
 
 use crate::app_settings::{AppSettings, DEFAULT_FILENAME_TEMPLATE, play_sound, scan_sounds};
+use crate::file_actions::expand_path;
 use crate::model::{
     AudioQuality, Container, ItemStatus, Quality, QueueEvent, QueueItem, QueueModel, Site,
     compact_url,
@@ -32,6 +33,7 @@ pub struct DownloadManager {
 }
 
 struct ActiveDownload {
+    id: u64,
     cancel: Arc<AtomicBool>,
     pid: Arc<AtomicU32>,
 }
@@ -47,6 +49,7 @@ struct DownloadTask {
     filename_template: String,
     cookies_from_browser: Option<String>,
     retries: usize,
+    single_item: bool,
 }
 
 enum DownloadEvent {
@@ -172,9 +175,45 @@ impl DownloadManager {
         }
     }
 
+    /// 指定した項目を直接開始する。かんたんダウンロードから使う。
+    pub fn start_item(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        let Some(item) = self.queue.read(cx).item(id) else {
+            return false;
+        };
+        if !matches!(item.status(), ItemStatus::Paused | ItemStatus::Queued) {
+            return false;
+        }
+        self.start_task(item.site(), Some(id), cx)
+    }
+
+    /// 指定した項目だけをキャンセルする。
+    pub fn cancel_item(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        let Some(site) = self.queue.read(cx).item(id).map(|item| item.site()) else {
+            return false;
+        };
+        let Some(active) = self.active.get(&site) else {
+            return false;
+        };
+        if active.id != id {
+            return false;
+        }
+        active.cancel.store(true, Ordering::SeqCst);
+        let pid = active.pid.load(Ordering::SeqCst);
+        if pid > 0 {
+            let _ = Command::new("/bin/kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+        true
+    }
+
     fn start_site(&mut self, site: Site, cx: &mut Context<Self>) {
+        let _ = self.start_task(site, None, cx);
+    }
+
+    fn start_task(&mut self, site: Site, id: Option<u64>, cx: &mut Context<Self>) -> bool {
         if self.active.contains_key(&site) || self.queue.read(cx).site_is_running(site) {
-            return;
+            return false;
         }
 
         let settings = AppSettings::load();
@@ -192,7 +231,10 @@ impl DownloadManager {
         let retries = self.queue.read(cx).settings().retries().max(1);
 
         let task = self.queue.update(cx, |model, cx| {
-            let item = model.take_next_for_site(site)?;
+            let item = match id {
+                Some(id) => model.take_item_for_site(site, id),
+                None => model.take_next_for_site(site),
+            }?;
             cx.emit(QueueEvent::Changed);
             cx.notify();
             Some(task_from_item(
@@ -203,7 +245,7 @@ impl DownloadManager {
             ))
         });
         let Some(task) = task else {
-            return;
+            return false;
         };
 
         let (tx, rx) = smol::channel::unbounded::<DownloadEvent>();
@@ -212,6 +254,7 @@ impl DownloadManager {
         self.active.insert(
             site,
             ActiveDownload {
+                id: task.id,
                 cancel: cancel.clone(),
                 pid: pid.clone(),
             },
@@ -225,6 +268,7 @@ impl DownloadManager {
         });
 
         let queue = self.queue.clone();
+        let continue_site = id.is_none();
         let manager = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let mut should_start_next = false;
@@ -300,13 +344,14 @@ impl DownloadManager {
 
             let _ = manager.update(cx, |manager, cx| {
                 manager.active.remove(&site);
-                if should_start_next {
+                if should_start_next && continue_site {
                     manager.start_site(site, cx);
                 }
                 cx.notify();
             });
         })
         .detach();
+        true
     }
 }
 
@@ -326,6 +371,7 @@ fn task_from_item(
         filename_template,
         cookies_from_browser,
         retries,
+        single_item: item.is_single_item(),
     }
 }
 
@@ -352,6 +398,15 @@ fn is_video_with_playlist(url: &str) -> bool {
             || path.starts_with("embed/");
     }
     false
+}
+
+fn apply_single_item_args(command: &mut Command, task: &DownloadTask) {
+    if task.single_item || is_video_with_playlist(&task.url) {
+        command.arg("--no-playlist");
+    }
+    if task.single_item {
+        command.arg("--playlist-items").arg("1");
+    }
 }
 
 /// 環境変数が設定されていれば、設定画面の値より優先する。
@@ -461,9 +516,7 @@ fn run_once(
     if let Some(browser) = &task.cookies_from_browser {
         command.arg("--cookies-from-browser").arg(browser);
     }
-    if is_video_with_playlist(&task.url) {
-        command.arg("--no-playlist");
-    }
+    apply_single_item_args(&mut command, task);
     command
         .arg("--ignore-config")
         .arg("--newline")
@@ -673,7 +726,7 @@ fn fetch_video_ids(task: &DownloadTask, yt_dlp: &Path, pid: &AtomicU32) -> Optio
     if let Some(browser) = &task.cookies_from_browser {
         command.arg("--cookies-from-browser").arg(browser);
     }
-    if is_video_with_playlist(&task.url) {
+    if task.single_item || is_video_with_playlist(&task.url) {
         command.arg("--no-playlist");
     }
 
@@ -685,7 +738,7 @@ fn fetch_video_ids(task: &DownloadTask, yt_dlp: &Path, pid: &AtomicU32) -> Optio
         .arg("--skip-download")
         .arg("--flat-playlist")
         .arg("--playlist-items")
-        .arg("1-2")
+        .arg(if task.single_item { "1" } else { "1-2" })
         .arg("--socket-timeout")
         .arg("20")
         .arg("--print")
@@ -929,20 +982,6 @@ fn convert_template(template: &str) -> String {
     converted
 }
 
-fn expand_path(path: &str) -> PathBuf {
-    if path == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-    }
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    PathBuf::from(path)
-}
-
 /// アプリが管理する yt-dlp を最優先で使う。
 ///
 /// `YT_DLP_PATH` は開発時の差し替え用として残す。管理下のバイナリが無い場合だけ
@@ -1118,6 +1157,7 @@ mod tests {
             filename_template: "${uploadDate}_${title}.${ext}".into(),
             cookies_from_browser: None,
             retries: 1,
+            single_item: false,
         }
     }
 
@@ -1270,6 +1310,30 @@ mod tests {
         assert!(!is_video_with_playlist(
             "https://www.youtube.com/watch?v=OHuNxItVx_A"
         ));
+    }
+
+    #[test]
+    fn single_item_downloads_are_limited_to_one_playlist_entry() {
+        fn args(command: &Command) -> Vec<String> {
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        }
+
+        let mut task = task();
+        task.single_item = true;
+        let mut command = Command::new("yt-dlp");
+        apply_single_item_args(&mut command, &task);
+        assert_eq!(
+            args(&command),
+            vec!["--no-playlist", "--playlist-items", "1"]
+        );
+
+        task.single_item = false;
+        let mut command = Command::new("yt-dlp");
+        apply_single_item_args(&mut command, &task);
+        assert!(args(&command).is_empty());
     }
 
     #[test]
