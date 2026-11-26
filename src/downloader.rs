@@ -169,7 +169,7 @@ impl DownloadManager {
         }
     }
 
-    /// 指定した項目を直接開始する。かんたんダウンロードから使う。
+    /// 指定した項目を直接開始する。完了後に同サイトの後続項目は自動開始しない。
     pub fn start_item(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
         let Some(item) = self.queue.read(cx).item(id) else {
             return false;
@@ -177,29 +177,39 @@ impl DownloadManager {
         if !matches!(item.status(), ItemStatus::Paused | ItemStatus::Queued) {
             return false;
         }
-        self.start_task(item.site(), Some(id), cx)
+        self.start_task(item.site(), Some(id), false, cx)
     }
 
-    /// 指定した項目だけをキャンセルする。
-    pub fn cancel_item(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
-        let Some(site) = self.queue.read(cx).item(id).map(|item| item.site()) else {
-            return false;
+    /// 現在実行中の指定項目だけをキャンセルする。
+    pub fn cancel_item(&mut self, id: u64, cx: &mut Context<Self>) -> Result<(), String> {
+        let Some(item) = self.queue.read(cx).item(id) else {
+            return Err("キャンセル対象の項目が見つかりません。".into());
         };
+        if item.status() != ItemStatus::Downloading {
+            return Err("実行中の項目だけをキャンセルできます。".into());
+        }
+        let site = item.site();
         let Some(active) = self.active.get(&site) else {
-            return false;
+            return Err("実行中のプロセスが見つかりません。".into());
         };
         if active.id != id {
-            return false;
+            return Err("指定した項目は現在実行中ではありません。".into());
         }
         cancel_active(active);
-        true
+        Ok(())
     }
 
     fn start_site(&mut self, site: Site, cx: &mut Context<Self>) {
-        let _ = self.start_task(site, None, cx);
+        let _ = self.start_task(site, None, true, cx);
     }
 
-    fn start_task(&mut self, site: Site, id: Option<u64>, cx: &mut Context<Self>) -> bool {
+    fn start_task(
+        &mut self,
+        site: Site,
+        id: Option<u64>,
+        continue_site: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.active.contains_key(&site) || self.queue.read(cx).site_is_running(site) {
             return false;
         }
@@ -256,7 +266,6 @@ impl DownloadManager {
         });
 
         let queue = self.queue.clone();
-        let continue_site = id.is_none();
         let manager = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let mut should_start_next = false;

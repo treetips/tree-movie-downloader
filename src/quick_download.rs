@@ -227,12 +227,16 @@ impl QuickDownloadView {
     pub fn start_or_cancel(&mut self, updating: bool, cx: &mut Context<Self>) {
         match self.action(cx) {
             QuickAction::Cancel => {
+                let mut cancel_error = None;
                 if let Some(id) = self.job_id {
-                    self.downloads.update(cx, |manager, cx| {
-                        manager.cancel_item(id, cx);
-                    });
+                    let result = self
+                        .downloads
+                        .update(cx, |manager, cx| manager.cancel_item(id, cx));
+                    if let Err(error) = result {
+                        cancel_error = Some(error);
+                    }
                 }
-                self.action_error = None;
+                self.action_error = cancel_error;
                 cx.notify();
             }
             QuickAction::Retry | QuickAction::Resume => self.retry_current(updating, cx),

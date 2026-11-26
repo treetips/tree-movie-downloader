@@ -552,15 +552,31 @@ pub enum QueueEvent {
 
 const LOG_LIMIT: usize = 200;
 const LOG_URL_LIMIT: usize = 64;
+/// 進捗不明の内部判定と表示に使う sentinel。表示を変更する場合は判定ヘルパーも一緒に更新する。
 const UNKNOWN_PROGRESS: &str = "—";
 
-fn is_http_url(url: &str) -> bool {
-    !url.chars()
+pub(crate) fn is_http_url(url: &str) -> bool {
+    if url
+        .chars()
         .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\\')
-        && url.split_once("://").is_some_and(|(scheme, rest)| {
-            !rest.is_empty()
-                && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        })
+    {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']').map(|(host, _)| host))
+        .unwrap_or_else(|| authority.split(':').next().unwrap_or_default());
+    !host.is_empty() && host != "." && host != ".."
 }
 
 /// 表に出すためのURL表記。スキームと `www.` を省いて識別しやすくする。

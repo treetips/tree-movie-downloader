@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
 
 pub(crate) fn expand_path(path: &str) -> PathBuf {
     if path == "~" {
@@ -24,7 +23,7 @@ pub(crate) fn open_output_file(path: &str) -> Result<(), String> {
         return Err(format!("ファイルが見つかりません: {}", path.display()));
     }
 
-    open_with_default_app(&path, "ファイルを開けませんでした")
+    open_with_default_app(&path)
 }
 
 pub(crate) fn open_output_folder(path: &str) -> Result<(), String> {
@@ -36,21 +35,21 @@ pub(crate) fn open_output_folder(path: &str) -> Result<(), String> {
         ));
     }
 
-    open_with_default_app(&path, "保存先を開けませんでした")
+    open_with_default_app(&path)
 }
 
-fn open_with_default_app(path: &Path, error_prefix: &str) -> Result<(), String> {
-    let mut child = Command::new("/usr/bin/open")
+fn open_with_default_app(path: &Path) -> Result<(), String> {
+    let status = Command::new("/usr/bin/open")
         .arg(path)
-        .spawn()
-        .map_err(|error| format!("{error_prefix} ({}): {error}", path.display()))?;
-    let path = path.display().to_string();
-    thread::spawn(move || {
-        if let Ok(status) = child.wait()
-            && !status.success()
-        {
-            eprintln!("failed to open {path}: {status}");
-        }
-    });
-    Ok(())
+        .status()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: 既定のアプリで開けませんでした（終了コード {}）",
+            path.display(),
+            status.code().unwrap_or(-1)
+        ))
+    }
 }

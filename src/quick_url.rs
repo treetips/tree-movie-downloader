@@ -1,5 +1,7 @@
 //! かんたんダウンロードで受け付ける動画URLの検証。
 
+use crate::model::is_http_url;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QuickUrlError {
     Empty,
@@ -29,35 +31,15 @@ pub(crate) fn validate_quick_url(input: &str) -> Result<String, QuickUrlError> {
     if url.lines().count() > 1 {
         return Err(QuickUrlError::Multiple);
     }
-    if url
-        .chars()
-        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\\')
-    {
+    if !is_http_url(url) {
         return Err(QuickUrlError::Invalid);
     }
-
-    let (scheme, rest) = url.split_once("://").ok_or(QuickUrlError::Invalid)?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return Err(QuickUrlError::Invalid);
-    }
-
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() || authority.contains('@') || !has_host(authority) {
-        return Err(QuickUrlError::Invalid);
-    }
+    let rest = url.split_once("://").map_or("", |(_, rest)| rest);
     if is_youtube_collection(rest) {
         return Err(QuickUrlError::Collection);
     }
 
     Ok(url.to_string())
-}
-
-fn has_host(authority: &str) -> bool {
-    let host = authority
-        .strip_prefix('[')
-        .and_then(|rest| rest.split_once(']').map(|(host, _)| host))
-        .unwrap_or_else(|| authority.split(':').next().unwrap_or_default());
-    !host.is_empty() && host != "." && host != ".."
 }
 
 fn is_youtube_collection(rest: &str) -> bool {
@@ -67,6 +49,7 @@ fn is_youtube_collection(rest: &str) -> bool {
         .next()
         .unwrap_or_default()
         .trim_start_matches("www.")
+        .trim_end_matches('.')
         .to_ascii_lowercase();
     if host != "youtube.com" && !host.ends_with(".youtube.com") {
         return false;
@@ -138,6 +121,7 @@ mod tests {
             "https://www.youtube.com/channel/UC123",
             "https://www.youtube.com/c/channel",
             "https://www.youtube.com/results?search_query=video",
+            "https://www.youtube.com./playlist?list=PL1",
             "https://www.youtube.com/",
         ] {
             assert_eq!(
