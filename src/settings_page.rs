@@ -1157,7 +1157,7 @@ impl Render for SettingsPage {
                                                     .text_xs()
                                                     .text_color(cx.theme().muted_foreground)
                                                     .child(
-                                                        "画質と音質は、一括ダウンロード画面の各行のメニューからURLごとに変更できます。",
+                                                        "画質と音質は、一括ダウンロード画面の各行のメニュー、URL追加ダイアログ、かんたんダウンロードの詳細設定で変更できます。",
                                                     ),
                                             )
                                             .child(setting_row(

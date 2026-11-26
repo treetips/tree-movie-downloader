@@ -191,6 +191,35 @@ pub const DEFAULT_CONTAINER: Container = Container::Mkv;
 /// `映像なし` を選んだときの音声用コンテナの初期値。
 pub const DEFAULT_AUDIO_CONTAINER: Container = Container::M4a;
 
+pub fn resolve_container(
+    quality: Quality,
+    current: Option<Container>,
+    settings_container: Container,
+) -> Container {
+    let options = Container::options_for(quality);
+    let fallback = if quality == Quality::AudioOnly {
+        DEFAULT_AUDIO_CONTAINER
+    } else {
+        DEFAULT_CONTAINER
+    };
+    current
+        .filter(|container| options.contains(container))
+        .or_else(|| {
+            options
+                .contains(&settings_container)
+                .then_some(settings_container)
+        })
+        .unwrap_or(fallback)
+}
+
+pub fn container_index(options: &[Container], selected: Container, fallback: Container) -> usize {
+    options
+        .iter()
+        .position(|container| *container == selected)
+        .or_else(|| options.iter().position(|container| *container == fallback))
+        .unwrap_or(0)
+}
+
 /// 自動リトライ回数の選択肢。
 pub const RETRY_CHOICES: [usize; 3] = [1, 3, 5];
 pub const RETRY_LABELS: [&str; 3] = ["1回", "3回", "5回"];
@@ -336,6 +365,7 @@ pub struct QueueItem {
     attempts: usize,
     error: Option<SharedString>,
     output_path: Option<SharedString>,
+    single_item: bool,
 }
 
 impl QueueItem {
@@ -356,8 +386,8 @@ impl QueueItem {
             destination: destination.into(),
             status: ItemStatus::Queued,
             progress: 0.0,
-            downloaded: "—".into(),
-            total: "—".into(),
+            downloaded: UNKNOWN_PROGRESS.into(),
+            total: UNKNOWN_PROGRESS.into(),
             eta: None,
             quality,
             audio,
@@ -365,7 +395,13 @@ impl QueueItem {
             attempts: 0,
             error: None,
             output_path: None,
+            single_item: false,
         }
+    }
+
+    fn single(mut self) -> Self {
+        self.single_item = true;
+        self
     }
 
     #[cfg(test)]
@@ -453,6 +489,18 @@ impl QueueItem {
             None
         }
     }
+
+    pub fn is_single_item(&self) -> bool {
+        self.single_item
+    }
+
+    pub fn is_total_unknown(&self) -> bool {
+        self.total.as_ref() == UNKNOWN_PROGRESS
+    }
+
+    pub fn is_downloaded_unknown(&self) -> bool {
+        self.downloaded.as_ref() == UNKNOWN_PROGRESS
+    }
 }
 
 /// ログの重要度。
@@ -504,6 +552,32 @@ pub enum QueueEvent {
 
 const LOG_LIMIT: usize = 200;
 const LOG_URL_LIMIT: usize = 64;
+/// 進捗不明の内部判定と表示に使う sentinel。表示を変更する場合は判定ヘルパーも一緒に更新する。
+const UNKNOWN_PROGRESS: &str = "—";
+
+pub(crate) fn is_http_url(url: &str) -> bool {
+    if url
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\\')
+    {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']').map(|(host, _)| host))
+        .unwrap_or_else(|| authority.split(':').next().unwrap_or_default());
+    !host.is_empty() && host != "." && host != ".."
+}
 
 /// 表に出すためのURL表記。スキームと `www.` を省いて識別しやすくする。
 pub fn display_url(url: &str) -> String {
@@ -588,7 +662,7 @@ impl QueueModel {
                 Container::Mkv,
                 default_downloads_dir(),
             )
-            .with_status(ItemStatus::Skipped, 0.0, "—", "—"),
+            .with_status(ItemStatus::Skipped, 0.0, UNKNOWN_PROGRESS, UNKNOWN_PROGRESS),
             QueueItem::new(
                 4,
                 "https://x.com/example/status/1840000000000000000",
@@ -606,7 +680,7 @@ impl QueueModel {
                 Container::Mkv,
                 default_downloads_dir(),
             )
-            .with_status(ItemStatus::Skipped, 0.0, "—", "—"),
+            .with_status(ItemStatus::Skipped, 0.0, UNKNOWN_PROGRESS, UNKNOWN_PROGRESS),
             QueueItem::new(
                 6,
                 "https://www.twitch.tv/videos/2233445566",
@@ -643,7 +717,7 @@ impl QueueModel {
                 Container::Webm,
                 default_downloads_dir(),
             )
-            .with_status(ItemStatus::Skipped, 0.0, "—", "—"),
+            .with_status(ItemStatus::Skipped, 0.0, UNKNOWN_PROGRESS, UNKNOWN_PROGRESS),
         ];
 
         let mut model = Self {
@@ -720,6 +794,10 @@ impl QueueModel {
 
     pub fn items(&self) -> &[QueueItem] {
         &self.items
+    }
+
+    pub fn item(&self, id: u64) -> Option<&QueueItem> {
+        self.items.iter().find(|item| item.id == id)
     }
 
     pub fn settings(&self) -> &DownloadSettings {
@@ -1017,27 +1095,15 @@ impl QueueModel {
         let urls: Vec<&str> = text
             .lines()
             .map(str::trim)
-            .filter(|line| {
-                line.split_once("://").is_some_and(|(scheme, _)| {
-                    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-                })
-            })
+            .filter(|line| is_http_url(line))
             .collect();
         let container = container.for_quality(quality);
-        let destination = if destination.trim().is_empty() {
-            self.default_destination()
-        } else {
-            destination.to_string()
-        };
 
         let mut added = 0;
         let mut added_sites = Vec::new();
         for url in urls {
-            let id = self.next_id;
-            self.next_id += 1;
-            let item = QueueItem::new(id, url, quality, audio, container, destination.clone());
-            added_sites.push(item.site);
-            self.items.push(item);
+            let (_, site) = self.push_url(url, quality, audio, container, destination, false);
+            added_sites.push(site);
             added += 1;
         }
 
@@ -1059,22 +1125,93 @@ impl QueueModel {
         added
     }
 
+    /// 動画URLを1件だけ追加し、その項目の識別子を返す。
+    pub fn add_single_url(
+        &mut self,
+        url: &str,
+        quality: Quality,
+        audio: AudioQuality,
+        container: Container,
+        destination: &str,
+    ) -> Option<u64> {
+        let url = url.trim();
+        if !is_http_url(url) {
+            return None;
+        }
+        let container = container.for_quality(quality);
+        let (id, site) = self.push_url(url, quality, audio, container, destination, true);
+        self.push_log_for_site(
+            site,
+            LogLevel::Info,
+            format!(
+                "1件をキューに追加しました（画質 {} / 音質 {} / コンテナ {}）",
+                quality.short(),
+                audio.label(),
+                container.label()
+            ),
+        );
+        Some(id)
+    }
+
+    fn push_url(
+        &mut self,
+        url: &str,
+        quality: Quality,
+        audio: AudioQuality,
+        container: Container,
+        destination: &str,
+        single_item: bool,
+    ) -> (u64, Site) {
+        let destination = if destination.trim().is_empty() {
+            self.default_destination()
+        } else {
+            destination.to_string()
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut item = QueueItem::new(id, url, quality, audio, container, destination);
+        if single_item {
+            item = item.single();
+        }
+        let site = item.site;
+        self.items.push(item);
+        (id, site)
+    }
+
     /// サイトの次に実行する項目を取得し、取得中に切り替える。
     pub fn take_next_for_site(&mut self, site: Site) -> Option<QueueItem> {
         let index = self.items.iter().position(|item| {
             item.site == site && matches!(item.status, ItemStatus::Paused | ItemStatus::Queued)
         })?;
+        Some(self.take_at(index))
+    }
+
+    /// 指定した項目を取得中に切り替える。ほかのサイトや項目は変更しない。
+    pub fn take_item_for_site(&mut self, site: Site, id: u64) -> Option<QueueItem> {
+        let index = self.items.iter().position(|item| {
+            item.id == id
+                && item.site == site
+                && matches!(item.status, ItemStatus::Paused | ItemStatus::Queued)
+        })?;
+        Some(self.take_at(index))
+    }
+
+    fn take_at(&mut self, index: usize) -> QueueItem {
         let item = &mut self.items[index];
         item.status = ItemStatus::Downloading;
         item.progress = 0.0;
         item.error = None;
         item.eta = None;
-        item.downloaded = "—".into();
-        item.total = "—".into();
+        item.downloaded = UNKNOWN_PROGRESS.into();
+        item.total = UNKNOWN_PROGRESS.into();
         let url = compact_url(&item.url);
         let item = item.clone();
-        self.push_log_for_site(site, LogLevel::Info, format!("{url} の取得を開始しました"));
-        Some(item)
+        self.push_log_for_site(
+            item.site,
+            LogLevel::Info,
+            format!("{url} の取得を開始しました"),
+        );
+        item
     }
 
     pub fn pause_site(&mut self, site: Site) {
@@ -1107,7 +1244,7 @@ impl QueueModel {
             item.status = ItemStatus::Completed;
             item.progress = 100.0;
             item.eta = None;
-            if item.total == "—" {
+            if item.total == UNKNOWN_PROGRESS {
                 item.downloaded = "完了".into();
             } else {
                 item.downloaded = item.total.clone();
@@ -1168,8 +1305,8 @@ impl QueueModel {
             item.attempts = 0;
             item.error = None;
             item.output_path = None;
-            item.downloaded = "—".into();
-            item.total = "—".into();
+            item.downloaded = UNKNOWN_PROGRESS.into();
+            item.total = UNKNOWN_PROGRESS.into();
             Some((site, compact_url(&item.url)))
         } else {
             None
@@ -1192,8 +1329,8 @@ impl QueueModel {
                 item.attempts = 0;
                 item.error = None;
                 item.output_path = None;
-                item.downloaded = "—".into();
-                item.total = "—".into();
+                item.downloaded = UNKNOWN_PROGRESS.into();
+                item.total = UNKNOWN_PROGRESS.into();
                 retried += 1;
             }
         }
@@ -1215,8 +1352,8 @@ impl QueueModel {
                 item.attempts = 0;
                 item.error = None;
                 item.output_path = None;
-                item.downloaded = "—".into();
-                item.total = "—".into();
+                item.downloaded = UNKNOWN_PROGRESS.into();
+                item.total = UNKNOWN_PROGRESS.into();
                 retried += 1;
             }
         }
@@ -1287,8 +1424,8 @@ impl QueueModel {
         item.eta = None;
         item.error = None;
         item.output_path = Some(path.into());
-        item.downloaded = "—".into();
-        item.total = "—".into();
+        item.downloaded = UNKNOWN_PROGRESS.into();
+        item.total = UNKNOWN_PROGRESS.into();
         let site = item.site;
         let url = compact_url(&item.url);
         self.push_log_for_site(
@@ -1434,6 +1571,88 @@ mod tests {
         assert_eq!(added_item.quality(), DEFAULT_QUALITY);
         assert_eq!(added_item.audio(), DEFAULT_AUDIO);
         assert_eq!(added_item.container(), DEFAULT_CONTAINER);
+    }
+
+    #[test]
+    fn single_url_additions_are_marked_for_single_item_downloads() {
+        let mut model = QueueModel::new();
+
+        let id = model
+            .add_single_url(
+                " https://example.com/video ",
+                DEFAULT_QUALITY,
+                DEFAULT_AUDIO,
+                DEFAULT_CONTAINER,
+                &default_downloads_dir(),
+            )
+            .expect("add one URL");
+
+        let item = model.item(id).expect("added item");
+        assert_eq!(item.url(), "https://example.com/video");
+        assert!(item.is_single_item());
+        assert_eq!(model.items().len(), 1);
+    }
+
+    #[test]
+    fn single_url_additions_reject_non_http_values() {
+        let mut model = QueueModel::new();
+
+        for url in [
+            "",
+            "example.com/video",
+            "ftp://example.com/video",
+            "https://",
+            "https://example.com/a b",
+            "https://example.com/a\nhttps://example.com/b",
+        ] {
+            assert!(
+                model
+                    .add_single_url(
+                        url,
+                        DEFAULT_QUALITY,
+                        DEFAULT_AUDIO,
+                        DEFAULT_CONTAINER,
+                        &default_downloads_dir(),
+                    )
+                    .is_none(),
+                "{url}"
+            );
+        }
+        assert!(model.items().is_empty());
+    }
+
+    #[test]
+    fn a_specific_item_can_start_without_changing_other_queued_items() {
+        let mut model = QueueModel::new();
+        let first = model.add_urls_with(
+            "https://example.com/first",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+        let second = model
+            .add_single_url(
+                "https://example.com/second",
+                DEFAULT_QUALITY,
+                DEFAULT_AUDIO,
+                DEFAULT_CONTAINER,
+                &default_downloads_dir(),
+            )
+            .expect("add one URL");
+        assert_eq!(first, 1);
+        let first_id = model.items()[0].id();
+
+        let started = model
+            .take_item_for_site(Site::Other, second)
+            .expect("start the requested item");
+
+        assert_eq!(started.id(), second);
+        assert_eq!(started.status(), ItemStatus::Downloading);
+        assert_eq!(
+            model.item(first_id).expect("first item").status(),
+            ItemStatus::Queued
+        );
     }
 
     #[test]

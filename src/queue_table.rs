@@ -1,7 +1,6 @@
 //! サイトごとに分かれたダウンロードキュー。
 
 use std::path::Path;
-use std::process::Command;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -18,6 +17,7 @@ use gpui_kit::*;
 
 use crate::activity_log::{logs_as_text, render_site_logs};
 use crate::downloader::DownloadManager;
+use crate::file_actions::open_output_file;
 use crate::model::{
     AudioQuality, Container, DEFAULT_QUALITY, ItemStatus, Quality, QueueEvent, QueueItem,
     QueueModel, Site, compact_url, display_url,
@@ -1097,19 +1097,6 @@ impl ItemActions {
             play_visible: matches!(status, ItemStatus::Completed | ItemStatus::Skipped),
         }
     }
-}
-
-fn open_output_file(path: &str) -> Result<(), String> {
-    let path = Path::new(path);
-    if !path.is_file() {
-        return Err("ファイルが見つかりません".to_string());
-    }
-
-    Command::new("/usr/bin/open")
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("ファイルを開けませんでした: {error}"))
 }
 
 fn actions_cell(model: Entity<QueueModel>, item: &QueueItem, running: bool) -> AnyElement {
