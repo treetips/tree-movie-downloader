@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 pub(crate) fn expand_path(path: &str) -> PathBuf {
     if path == "~" {
@@ -18,16 +19,12 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
 }
 
 pub(crate) fn open_output_file(path: &str) -> Result<(), String> {
-    let path = Path::new(path);
+    let path = expand_path(path);
     if !path.is_file() {
         return Err("ファイルが見つかりません".to_string());
     }
 
-    Command::new("/usr/bin/open")
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("ファイルを開けませんでした: {error}"))
+    open_with_default_app(&path, "ファイルを開けませんでした")
 }
 
 pub(crate) fn open_output_folder(path: &str) -> Result<(), String> {
@@ -36,9 +33,16 @@ pub(crate) fn open_output_folder(path: &str) -> Result<(), String> {
         return Err("保存先フォルダが見つかりません".to_string());
     }
 
-    Command::new("/usr/bin/open")
+    open_with_default_app(&path, "保存先を開けませんでした")
+}
+
+fn open_with_default_app(path: &Path, error_prefix: &str) -> Result<(), String> {
+    let mut child = Command::new("/usr/bin/open")
         .arg(path)
         .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("保存先を開けませんでした: {error}"))
+        .map_err(|error| format!("{error_prefix}: {error}"))?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }

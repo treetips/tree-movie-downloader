@@ -147,7 +147,7 @@ impl QuickDownloadView {
                     .copied()
                     .find(|quality| quality.label() == *label)
                     .unwrap_or(DEFAULT_QUALITY);
-                this.sync_container(quality, false, window, cx);
+                this.sync_container(quality, window, cx);
             },
         );
 
@@ -243,7 +243,6 @@ impl QuickDownloadView {
             return;
         }
         if updating || self.queue.read(cx).active_item().is_some() {
-            self.action_error = Some("別の処理が終わるまで待ってから再試行してください。".into());
             cx.notify();
             return;
         }
@@ -277,11 +276,6 @@ impl QuickDownloadView {
             }
         };
         if updating || self.queue.read(cx).active_item().is_some() {
-            self.action_error = Some(if updating {
-                "更新処理中はダウンロードを開始できません。".into()
-            } else {
-                "別のダウンロードが実行中です。完了後に開始してください。".into()
-            });
             cx.notify();
             return;
         }
@@ -347,13 +341,7 @@ impl QuickDownloadView {
         cx.notify();
     }
 
-    fn sync_container(
-        &mut self,
-        quality: Quality,
-        reset: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn sync_container(&mut self, quality: Quality, window: &mut Window, cx: &mut Context<Self>) {
         let options = Container::options_for(quality);
         let fallback = if quality == Quality::AudioOnly {
             DEFAULT_AUDIO_CONTAINER
@@ -361,20 +349,17 @@ impl QuickDownloadView {
             DEFAULT_CONTAINER
         };
         let settings_container = self.queue.read(cx).settings().container();
-        let current = if reset {
-            None
-        } else {
-            self.container
-                .read(cx)
-                .selected_value()
-                .copied()
-                .and_then(|label| {
-                    Container::ALL
-                        .iter()
-                        .copied()
-                        .find(|container| container.label() == label)
-                })
-        };
+        let current = self
+            .container
+            .read(cx)
+            .selected_value()
+            .copied()
+            .and_then(|label| {
+                Container::ALL
+                    .iter()
+                    .copied()
+                    .find(|container| container.label() == label)
+            });
         let selected = current
             .filter(|container| options.contains(container))
             .or_else(|| {
@@ -451,31 +436,32 @@ impl QuickDownloadView {
                                     .w_full()
                                     .disabled(busy),
                             )
-                            .when_some(validation_error, |_this, error| {
-                                let mut row = h_flex()
-                                    .items_start()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .text_sm()
-                                            .text_color(cx.theme().danger)
-                                            .child(error.message()),
-                                    );
-                                if error == QuickUrlError::Collection {
-                                    row = row.child(
-                                        Button::new("quick-open-batch")
-                                            .small()
-                                            .outline()
-                                            .label("一括ダウンロードを開く")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.emit(QuickDownloadEvent::OpenBatch);
-                                                this.validation_error = None;
-                                                cx.notify();
-                                            })),
-                                    );
-                                }
-                                row
+                            .when_some(validation_error, |this, error| {
+                                this.child(
+                                    h_flex()
+                                        .items_start()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_sm()
+                                                .text_color(cx.theme().danger)
+                                                .child(error.message()),
+                                        )
+                                        .when(error == QuickUrlError::Collection, |row| {
+                                            row.child(
+                                                Button::new("quick-open-batch")
+                                                    .small()
+                                                    .outline()
+                                                    .label("一括ダウンロードを開く")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        cx.emit(QuickDownloadEvent::OpenBatch);
+                                                        this.validation_error = None;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                        }),
+                                )
                             }),
                     )
                     .child(
@@ -660,7 +646,7 @@ impl QuickDownloadView {
                 .child(
                     Progress::new(("quick-progress", job.id()))
                         .value(progress)
-                        .loading(job.total().as_ref() == "—")
+                        .loading(job.is_total_unknown())
                         .color(cx.theme().primary),
                 )
                 .child(
@@ -786,12 +772,10 @@ fn status_color(status: ItemStatus, cx: &gpui_kit::App) -> gpui_kit::Hsla {
 fn status_label(job: &QueueItem) -> &'static str {
     match job.status() {
         ItemStatus::Queued => "開始待ち",
-        ItemStatus::Downloading if job.progress() <= 0.0 && job.downloaded().as_ref() == "—" => {
-            "取得中"
-        }
+        ItemStatus::Downloading if job.progress() <= 0.0 && job.is_downloaded_unknown() => "取得中",
         ItemStatus::Downloading if job.progress() >= 100.0 => "変換中",
         ItemStatus::Downloading => "ダウンロード中",
-        ItemStatus::Paused => "キャンセル済み",
+        ItemStatus::Paused => "一時停止",
         ItemStatus::Completed => "完了",
         ItemStatus::Failed => "失敗",
         ItemStatus::Skipped => "保存済み",

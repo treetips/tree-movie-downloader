@@ -165,13 +165,7 @@ impl DownloadManager {
     /// 実行中のプロセスを停止する。キュー項目自体は削除しない。
     pub fn cancel_site(&mut self, site: Site) {
         if let Some(active) = self.active.get(&site) {
-            active.cancel.store(true, Ordering::SeqCst);
-            let pid = active.pid.load(Ordering::SeqCst);
-            if pid > 0 {
-                let _ = Command::new("/bin/kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
-            }
+            cancel_active(active);
         }
     }
 
@@ -197,13 +191,7 @@ impl DownloadManager {
         if active.id != id {
             return false;
         }
-        active.cancel.store(true, Ordering::SeqCst);
-        let pid = active.pid.load(Ordering::SeqCst);
-        if pid > 0 {
-            let _ = Command::new("/bin/kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
-        }
+        cancel_active(active);
         true
     }
 
@@ -268,7 +256,7 @@ impl DownloadManager {
         });
 
         let queue = self.queue.clone();
-        let continue_site = id.is_none();
+        let continue_site = id.is_none() || !task.single_item;
         let manager = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let mut should_start_next = false;
@@ -400,8 +388,26 @@ fn is_video_with_playlist(url: &str) -> bool {
     false
 }
 
+fn cancel_active(active: &ActiveDownload) {
+    active.cancel.store(true, Ordering::SeqCst);
+    let pid = active.pid.load(Ordering::SeqCst);
+    if pid > 0 {
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
+fn single_video_only(task: &DownloadTask) -> bool {
+    task.single_item || is_video_with_playlist(&task.url)
+}
+
+fn playlist_items_arg(task: &DownloadTask) -> &'static str {
+    if task.single_item { "1" } else { "1-2" }
+}
+
 fn apply_single_item_args(command: &mut Command, task: &DownloadTask) {
-    if task.single_item || is_video_with_playlist(&task.url) {
+    if single_video_only(task) {
         command.arg("--no-playlist");
     }
     if task.single_item {
@@ -726,7 +732,7 @@ fn fetch_video_ids(task: &DownloadTask, yt_dlp: &Path, pid: &AtomicU32) -> Optio
     if let Some(browser) = &task.cookies_from_browser {
         command.arg("--cookies-from-browser").arg(browser);
     }
-    if task.single_item || is_video_with_playlist(&task.url) {
+    if single_video_only(task) {
         command.arg("--no-playlist");
     }
 
@@ -738,7 +744,7 @@ fn fetch_video_ids(task: &DownloadTask, yt_dlp: &Path, pid: &AtomicU32) -> Optio
         .arg("--skip-download")
         .arg("--flat-playlist")
         .arg("--playlist-items")
-        .arg(if task.single_item { "1" } else { "1-2" })
+        .arg(playlist_items_arg(task))
         .arg("--socket-timeout")
         .arg("20")
         .arg("--print")

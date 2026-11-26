@@ -76,20 +76,13 @@ fn is_youtube_collection(rest: &str) -> bool {
     if path == "playlist" || path.starts_with("playlist/") {
         return true;
     }
-    if path.starts_with('@')
+    path.is_empty()
+        || path.starts_with('@')
         || path.starts_with("channel/")
         || path.starts_with("user/")
         || path.starts_with("c/")
         || path.starts_with("feed/")
         || path == "results"
-    {
-        return true;
-    }
-
-    !(path == "watch"
-        || path.starts_with("shorts/")
-        || path.starts_with("live/")
-        || path.starts_with("embed/"))
 }
 
 #[cfg(test)]
@@ -102,6 +95,9 @@ mod tests {
             "https://www.youtube.com/watch?v=abc123&list=PL1",
             "https://youtu.be/abc123",
             "https://www.youtube.com/shorts/abc123",
+            "https://www.youtube.com/clip/Ugkx123",
+            "https://www.youtube.com/v/abc123",
+            "https://www.youtube.com/watch_popup?v=abc123",
             "https://x.com/example/status/123",
             "https://www.twitch.tv/videos/123",
             "HTTPS://example.com/video",
@@ -142,6 +138,7 @@ mod tests {
             "https://www.youtube.com/channel/UC123",
             "https://www.youtube.com/c/channel",
             "https://www.youtube.com/results?search_query=video",
+            "https://www.youtube.com/",
         ] {
             assert_eq!(
                 validate_quick_url(url),

@@ -464,6 +464,14 @@ impl QueueItem {
     pub fn is_single_item(&self) -> bool {
         self.single_item
     }
+
+    pub fn is_total_unknown(&self) -> bool {
+        self.total.as_ref() == "—"
+    }
+
+    pub fn is_downloaded_unknown(&self) -> bool {
+        self.downloaded.as_ref() == "—"
+    }
 }
 
 /// ログの重要度。
@@ -515,6 +523,13 @@ pub enum QueueEvent {
 
 const LOG_LIMIT: usize = 200;
 const LOG_URL_LIMIT: usize = 64;
+
+fn is_http_url(url: &str) -> bool {
+    url.split_once("://").is_some_and(|(scheme, rest)| {
+        !rest.is_empty()
+            && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+    })
+}
 
 /// 表に出すためのURL表記。スキームと `www.` を省いて識別しやすくする。
 pub fn display_url(url: &str) -> String {
@@ -1032,11 +1047,7 @@ impl QueueModel {
         let urls: Vec<&str> = text
             .lines()
             .map(str::trim)
-            .filter(|line| {
-                line.split_once("://").is_some_and(|(scheme, _)| {
-                    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-                })
-            })
+            .filter(|line| is_http_url(line))
             .collect();
         let container = container.for_quality(quality);
         let destination = if destination.trim().is_empty() {
@@ -1084,7 +1095,7 @@ impl QueueModel {
         destination: &str,
     ) -> Option<u64> {
         let url = url.trim();
-        if url.is_empty() {
+        if !is_http_url(url) {
             return None;
         }
         let container = container.for_quality(quality);
@@ -1524,6 +1535,32 @@ mod tests {
         assert_eq!(item.url(), "https://example.com/video");
         assert!(item.is_single_item());
         assert_eq!(model.items().len(), 1);
+    }
+
+    #[test]
+    fn single_url_additions_reject_non_http_values() {
+        let mut model = QueueModel::new();
+
+        for url in [
+            "",
+            "example.com/video",
+            "ftp://example.com/video",
+            "https://",
+        ] {
+            assert!(
+                model
+                    .add_single_url(
+                        url,
+                        DEFAULT_QUALITY,
+                        DEFAULT_AUDIO,
+                        DEFAULT_CONTAINER,
+                        &default_downloads_dir(),
+                    )
+                    .is_none(),
+                "{url}"
+            );
+        }
+        assert!(model.items().is_empty());
     }
 
     #[test]

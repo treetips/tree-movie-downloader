@@ -754,11 +754,12 @@ impl AppView {
     }
 
     fn open_page(&mut self, target: Page, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page != target {
+        let changed = self.page != target;
+        if changed {
             self.page = target;
             cx.notify();
         }
-        if target == Page::Quick {
+        if changed && target == Page::Quick {
             self.quick_download.update(cx, |view, cx| {
                 view.sync_destinations(window, cx);
                 view.focus_url(window, cx);
