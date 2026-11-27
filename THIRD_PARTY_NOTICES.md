@@ -15,3 +15,9 @@
 - 配布バイナリ: [eugeneware/ffmpeg-static](https://github.com/eugeneware/ffmpeg-static)
 - ライセンス: ビルドに含まれるコーデックにより異なります。配布バイナリの `LICENSE` を参照してください。
 - 配布物: [ffmpeg-static の Releases](https://github.com/eugeneware/ffmpeg-static/releases)
+
+## Deno
+
+- 配布元: [denoland/deno](https://github.com/denoland/deno)
+- ライセンス: MIT
+- 配布物: [Deno の Releases](https://github.com/denoland/deno/releases)

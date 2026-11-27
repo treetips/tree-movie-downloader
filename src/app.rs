@@ -791,6 +791,8 @@ impl AppView {
             tools::installed_version(tools::YT_DLP).unwrap_or_else(|| "未取得".to_string());
         let ffmpeg_version =
             tools::installed_version(tools::FFMPEG).unwrap_or_else(|| "未取得".to_string());
+        let deno_version =
+            tools::installed_version(tools::DENO).unwrap_or_else(|| "未取得".to_string());
         let (update_state, library_state, update_status, library_status, checking, installing) = {
             let controller = self.update_controller.read(cx);
             (
@@ -889,6 +891,7 @@ impl AppView {
                         .child(about_row("Copyright", "Copyright @2026 treetips555", cx))
                         .child(about_row("yt-dlp", yt_dlp_version, cx))
                         .child(about_row("ffmpeg", ffmpeg_version, cx))
+                        .child(about_row("Deno", deno_version, cx))
                         .child(Separator::horizontal())
                         .child(
                             v_flex()
@@ -1484,7 +1487,7 @@ impl AppView {
                                         .text_sm()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(
-                                            "yt-dlp と ffmpeg のうち、未準備・更新対象のツールを GitHub Releases から取得します。日常の更新確認とは分けて扱い、更新の自動インストールはしません。",
+                                            "yt-dlp・ffmpeg・Deno のうち、未準備・更新対象のツールを GitHub Releases から取得します。日常の更新確認とは分けて扱い、更新の自動インストールはしません。",
                                         ),
                                 ),
                         ),

@@ -9,7 +9,7 @@
 
 ### ライブラリ
 
-- ライブラリは yt-dlp と ffmpeg（ffprobe を含む）を対象にします。
+- ライブラリは yt-dlp・ffmpeg（ffprobe を含む）・Deno を対象にします。
 - `tools-info.json` の `version` / `platform` と、ローカル記録 `.installed.json` の `version` / `platform` を比較します。
 - 記録が配布情報と一致していても、対象バイナリが実行可能なファイルとして存在しなければ更新対象にします。同じバージョンでも欠落や破損を修復するためです。
 - 更新対象だけをダウンロードし、SHA-256 を検証して置換します。

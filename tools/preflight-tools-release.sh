@@ -9,15 +9,17 @@
 #   TAG                配布先のリリースタグ（既定: tools-latest）
 #   YT_DLP_VERSION     yt-dlp のバージョン（空なら API から解決）
 #   FFMPEG_STATIC_TAG  ffmpeg-static のタグ（空なら API から解決）
+#   DENO_VERSION       Deno のバージョン（空なら API から解決）
 #   FORCE              true なら既存配布情報に関係なく更新ありとして扱う
 #   GH_TOKEN           GitHub API の認証トークン（任意）
-#   GITHUB_OUTPUT      changed / yt_dlp_version / ffmpeg_static_tag の出力先
+#   GITHUB_OUTPUT      changed / yt_dlp_version / ffmpeg_static_tag / deno_version の出力先
 set -euo pipefail
 
 TAG="${TAG:-tools-latest}"
 REPOSITORY="${REPOSITORY:-treetips/tree-movie-downloader}"
 YT_DLP_VERSION="${YT_DLP_VERSION:-}"
 FFMPEG_STATIC_TAG="${FFMPEG_STATIC_TAG:-}"
+DENO_VERSION="${DENO_VERSION:-}"
 FORCE="${FORCE:-false}"
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/stdout}"
 
@@ -97,12 +99,17 @@ if [[ -z "$FFMPEG_STATIC_TAG" ]]; then
     fail "ffmpeg-static の最新タグを解決できませんでした。"
   fi
 fi
+if [[ -z "$DENO_VERSION" ]]; then
+  if ! DENO_VERSION="$(resolve_latest 'denoland/deno' "$WORK_DIR/deno-latest.json")"; then
+    fail "Deno の最新バージョンを解決できませんでした。"
+  fi
+fi
 
-python3 - "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG" <<'PY'
+python3 - "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG" "$DENO_VERSION" <<'PY'
 import re
 import sys
 
-for label, value in zip(("yt-dlp", "ffmpeg-static"), sys.argv[1:]):
+for label, value in zip(("yt-dlp", "ffmpeg-static", "Deno"), sys.argv[1:]):
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", value) is None:
         raise SystemExit(f"{label} のバージョンに不正な文字が含まれています")
 PY
@@ -151,7 +158,7 @@ PY
       if ! api_curl -fsSL "$manifest_url" -o "$manifest"; then
         fail "配布先リリース $TAG の tools-info.json を取得できませんでした。"
       fi
-      if ! changed="$(python3 - "$manifest" "$release_response" "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG" <<'PY'
+      if ! changed="$(python3 - "$manifest" "$release_response" "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG" "$DENO_VERSION" <<'PY'
 import json
 import pathlib
 import posixpath
@@ -161,7 +168,7 @@ from urllib.parse import unquote, urlparse
 
 path = pathlib.Path(sys.argv[1])
 release_path = pathlib.Path(sys.argv[2])
-resolved = {"yt-dlp": sys.argv[3], "ffmpeg": sys.argv[4]}
+resolved = {"yt-dlp": sys.argv[3], "ffmpeg": sys.argv[4], "deno": sys.argv[5]}
 platforms = {
     "macos-aarch64",
     "macos-x86_64",
@@ -169,7 +176,9 @@ platforms = {
     "linux-x86_64",
     "linux-aarch64",
 }
-expected = {(name, platform) for name in resolved for platform in platforms}
+# Deno 追加前の manifest は不正とせず、Deno を再作成するきっかけにする。
+required = {(name, platform) for name in ("yt-dlp", "ffmpeg") for platform in platforms}
+expected = required | {("deno", platform) for platform in platforms}
 
 try:
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -210,10 +219,11 @@ for entry in entries:
     entry_files.add(unquote(posixpath.basename(parsed.path)))
     versions[name].add(version)
 
-if seen != expected:
+if not required <= seen:
     raise SystemExit("tools-info.json の必須 entry が不足しています")
-if any(len(values) != 1 for values in versions.values()):
+if any(len(versions[name]) != 1 for name in ("yt-dlp", "ffmpeg")):
     raise SystemExit("tools-info.json のツール間で version が一致していません")
+deno_versions_inconsistent = len(versions["deno"]) > 1
 
 try:
     release = json.loads(release_path.read_text(encoding="utf-8"))
@@ -225,10 +235,11 @@ asset_names = {
     if isinstance(asset, dict) and isinstance(asset.get("name"), str)
 }
 missing_assets = (entry_files | {"SHA256SUMS.txt"}) - asset_names
-current = {name: next(iter(values)) for name, values in versions.items()}
+current = {name: next(iter(values)) for name, values in versions.items() if values}
 # ZIP は再生成で checksum が変わり得るため、同一 version/tag の差し替えは検知しない。
-version_changed = any(current[name] != resolved[name] for name in resolved)
-print("true" if version_changed or missing_assets else "false")
+version_changed = any(current.get(name) != resolved[name] for name in resolved)
+deno_needs_rebuild = bool(expected - seen) or deno_versions_inconsistent
+print("true" if version_changed or missing_assets or deno_needs_rebuild else "false")
 PY
       )"; then
         fail "配布先リリース $TAG の tools-info.json が不正です。"
@@ -247,10 +258,11 @@ fi
   printf 'changed=%s\n' "$changed"
   printf 'yt_dlp_version=%s\n' "$YT_DLP_VERSION"
   printf 'ffmpeg_static_tag=%s\n' "$FFMPEG_STATIC_TAG"
+  printf 'deno_version=%s\n' "$DENO_VERSION"
 } >> "$OUTPUT_FILE"
 
 if [[ "$changed" == "true" ]]; then
-  echo "更新あり: yt-dlp=$YT_DLP_VERSION, ffmpeg-static=$FFMPEG_STATIC_TAG"
+  echo "更新あり: yt-dlp=$YT_DLP_VERSION, ffmpeg-static=$FFMPEG_STATIC_TAG, Deno=$DENO_VERSION"
 else
-  echo "更新なし: yt-dlp=$YT_DLP_VERSION, ffmpeg-static=$FFMPEG_STATIC_TAG"
+  echo "更新なし: yt-dlp=$YT_DLP_VERSION, ffmpeg-static=$FFMPEG_STATIC_TAG, Deno=$DENO_VERSION"
 fi
