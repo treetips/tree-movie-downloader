@@ -773,7 +773,7 @@ impl AppView {
     ) -> impl IntoElement {
         v_flex()
             .size_full()
-            .child(self.render_toolbar(total, empty, cx))
+            .child(self.render_toolbar(empty, cx))
             .child(
                 div()
                     .flex_1()
@@ -1520,12 +1520,7 @@ impl AppView {
         !running && has_pending
     }
 
-    fn render_toolbar(
-        &self,
-        total: usize,
-        empty: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_toolbar(&self, empty: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.running;
         let updating = self.is_updating(cx);
         let can_add = Self::can_add_urls(running);
@@ -1584,23 +1579,6 @@ impl AppView {
                         cx.listener(|this, _, window, cx| this.open_clear_queue_dialog(window, cx)),
                     ),
             )
-            .child(div().flex_1())
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        Icon::new(IconName::ListVideo)
-                            .xsmall()
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{total}件のキュー")),
-                    ),
-            )
     }
 
     fn render_queue(
@@ -1633,7 +1611,23 @@ impl AppView {
                     .items_center()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().text_sm().font_semibold().child("キュー"))
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Icon::new(IconName::ListVideo)
+                                    .xsmall()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(format!("{total}件のキュー")),
+                            ),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -1941,16 +1935,18 @@ impl Render for AppView {
                                 .child(layers),
                         )
                     })
-                    .child(div().size_full().pt_3().child(if tools_ready {
+                    .child(div().size_full().child(if tools_ready {
                         page_content
                     } else {
                         self.render_tool_bootstrap(cx).into_any_element()
                     }))
                     .child(
-                        div()
+                        h_flex()
                             .absolute()
-                            .top_1()
+                            .top_0()
                             .right_3()
+                            .h_12()
+                            .items_center()
                             .child(self.render_update_area(cx)),
                     ),
             )

@@ -2,6 +2,7 @@
 
 - ステータス: Accepted
 - 日付: 2026-11-27
+- 更新通知の配置と余白は [ADR 0012](./0012-align-update-area-with-toolbar.md) で置換
 
 ## 背景
 
