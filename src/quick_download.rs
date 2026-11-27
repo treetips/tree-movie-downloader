@@ -221,8 +221,10 @@ impl QuickDownloadView {
                 ItemStatus::Queued => QuickAction::Resume,
                 ItemStatus::Failed | ItemStatus::Paused => QuickAction::Retry,
                 ItemStatus::Completed | ItemStatus::Skipped => QuickAction::Redownload,
-                ItemStatus::Downloading => QuickAction::Cancel,
+                _ => QuickAction::Start,
             }
+        } else if redownload_id(self.queue.read(cx), url.trim()).is_some() {
+            QuickAction::Redownload
         } else {
             QuickAction::Start
         }
@@ -299,12 +301,7 @@ impl QuickDownloadView {
             return;
         }
         let redownload_id = if self.queue.read(cx).has_url(&url) {
-            let id = self.job_id.filter(|id| {
-                self.queue.read(cx).item(*id).is_some_and(|item| {
-                    item.url().as_ref() == url.trim()
-                        && matches!(item.status(), ItemStatus::Completed | ItemStatus::Skipped)
-                })
-            });
+            let id = redownload_id(self.queue.read(cx), &url);
             let Some(id) = id else {
                 self.validation_error = None;
                 self.action_error = Some("このURLはすでにキューに追加されています。".into());
@@ -380,14 +377,22 @@ impl QuickDownloadView {
                 .update(cx, |manager, cx| manager.start_item(id, cx))
         };
         if !started {
-            self.queue.update(cx, |model, cx| {
-                model.remove(id);
-                cx.emit(QueueEvent::Changed);
-                cx.notify();
-            });
-            self.job_id = None;
-            self.action_error =
-                Some("ダウンロードを開始できませんでした。もう一度お試しください。".into());
+            if redownload {
+                self.job_id = Some(id);
+                self.action_error = Some(
+                    "再ダウンロードを開始できませんでした。キューに残しているため、後から開始できます。"
+                        .into(),
+                );
+            } else {
+                self.queue.update(cx, |model, cx| {
+                    model.remove(id);
+                    cx.emit(QueueEvent::Changed);
+                    cx.notify();
+                });
+                self.job_id = None;
+                self.action_error =
+                    Some("ダウンロードを開始できませんでした。もう一度お試しください。".into());
+            }
         }
         cx.notify();
     }
@@ -809,6 +814,17 @@ impl Render for QuickDownloadView {
     }
 }
 
+fn redownload_id(model: &QueueModel, url: &str) -> Option<u64> {
+    model
+        .items()
+        .iter()
+        .find(|item| {
+            item.url().as_ref() == url.trim()
+                && matches!(item.status(), ItemStatus::Completed | ItemStatus::Skipped)
+        })
+        .map(|item| item.id())
+}
+
 fn status_color(status: ItemStatus, cx: &gpui_kit::App) -> gpui_kit::Hsla {
     match status {
         ItemStatus::Completed => cx.theme().success,
@@ -887,6 +903,33 @@ mod tests {
         assert_eq!(QuickAction::Cancel.label(), "キャンセル");
         assert_eq!(QuickAction::Retry.label(), "再試行");
         assert_eq!(QuickAction::Resume.label(), "開始");
+    }
+
+    #[test]
+    fn completed_urls_can_be_found_even_when_they_are_not_the_current_job() {
+        let mut model = QueueModel::new();
+        let first = model
+            .add_single_url(
+                "https://example.com/a",
+                DEFAULT_QUALITY,
+                DEFAULT_AUDIO,
+                DEFAULT_CONTAINER,
+                "/tmp",
+            )
+            .expect("add first URL");
+        model.complete_item(first, Some("/tmp/a.mkv"));
+        model
+            .add_single_url(
+                "https://example.com/b",
+                DEFAULT_QUALITY,
+                DEFAULT_AUDIO,
+                DEFAULT_CONTAINER,
+                "/tmp",
+            )
+            .expect("add second URL");
+
+        assert_eq!(redownload_id(&model, "https://example.com/a"), Some(first));
+        assert_eq!(redownload_id(&model, "https://example.com/b"), None);
     }
 
     #[test]

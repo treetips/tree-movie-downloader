@@ -1380,7 +1380,7 @@ impl QueueModel {
         }
     }
 
-    /// yt-dlpの警告を、その項目のサイトのログへ記録する。
+    /// 情報ログを、その項目のサイトのログへ記録する。
     pub fn info_item(&mut self, id: u64, message: impl Into<SharedString>) {
         let Some(item) = self.items.iter().find(|item| item.id == id) else {
             return;
@@ -1390,6 +1390,7 @@ impl QueueModel {
         self.push_log_for_site(site, LogLevel::Info, format!("[{url}] {}", message.into()));
     }
 
+    /// yt-dlpの警告を、その項目のサイトのログへ記録する。
     pub fn warn_item(&mut self, id: u64, message: impl Into<SharedString>) {
         let Some(item) = self.items.iter().find(|item| item.id == id) else {
             return;

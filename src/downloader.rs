@@ -202,7 +202,10 @@ impl DownloadManager {
         self.start_item_with_force(id, false, cx)
     }
 
-    /// 完了・保存済み項目を、明示的な再ダウンロードとして開始する。
+    /// 待機中・一時停止中の項目を、既存ファイルの上書きを許可して開始する。
+    ///
+    /// 完了・スキップ済み項目は、呼び出し側で先に再ダウンロード用の項目へ
+    /// 置き換えてから、その新しい識別子を渡す必要がある。
     pub fn start_forced_item(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
         self.start_item_with_force(id, true, cx)
     }
@@ -431,8 +434,10 @@ fn spawn_thumbnail_load(queue: Entity<QueueModel>, id: u64, url: String, cx: &mu
                 });
             }
             Err(error) => {
-                thumbnail_queue.update(cx, |model, _| {
+                thumbnail_queue.update(cx, |model, cx| {
                     model.info_item(id, format!("サムネイルを表示できません: {error}"));
+                    cx.emit(QueueEvent::Changed);
+                    cx.notify();
                 });
             }
         }
@@ -910,25 +915,32 @@ fn fetch_video_metadata(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    match parse_probe_metadata(&stdout) {
-        Ok(entries) => Some(entries),
-        Err(error) => {
-            let _ = tx.send_blocking(DownloadEvent::Warning {
-                id: task.id,
-                message: format!("yt-dlpのメタデータを解析できませんでした: {error}"),
-            });
-            None
-        }
+    let (entries, invalid_lines) = parse_probe_metadata(&stdout);
+    if invalid_lines > 0 {
+        let _ = tx.send_blocking(DownloadEvent::Warning {
+            id: task.id,
+            message: format!(
+                "yt-dlpのメタデータ{invalid_lines}行を解析できませんでした。有効な行だけを確認します。"
+            ),
+        });
     }
+    Some(entries)
 }
 
-fn parse_probe_metadata(stdout: &str) -> Result<Vec<PrintedMetadata>, String> {
-    stdout
+fn parse_probe_metadata(stdout: &str) -> (Vec<PrintedMetadata>, usize) {
+    let mut entries = Vec::new();
+    let mut invalid_lines = 0;
+    for line in stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).map_err(|error| error.to_string()))
-        .collect()
+    {
+        match serde_json::from_str(line) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => invalid_lines += 1,
+        }
+    }
+    (entries, invalid_lines)
 }
 
 fn parse_metadata_line(line: &str) -> Option<PrintedMetadata> {
@@ -1585,9 +1597,9 @@ mod tests {
 
     #[test]
     fn parses_video_ids_from_print_output() {
-        let metadata =
-            parse_probe_metadata("{\"id\":\"abc123\"}\n\n{\"id\":\" def456 \"}\n{\"id\":\"NA\"}\n")
-                .expect("parse metadata");
+        let (metadata, invalid_lines) =
+            parse_probe_metadata("{\"id\":\"abc123\"}\n\n{\"id\":\" def456 \"}\n{\"id\":\"NA\"}\n");
+        assert_eq!(invalid_lines, 0);
         let ids: Vec<_> = metadata
             .iter()
             .filter_map(|entry| metadata_value(entry.id.as_deref()))
@@ -1601,7 +1613,8 @@ mod tests {
             "{\"id\":\"abc123\",\"title\":\"日本語 \\\"タイトル\\\"\",\"thumbnail\":\"https://example.com/thumb.jpg\"}\n",
             "{\"id\":\"def456\",\"title\":\"\",\"thumbnail\":\"NA\"}\n",
         );
-        let metadata = parse_probe_metadata(stdout).expect("parse metadata");
+        let (metadata, invalid_lines) = parse_probe_metadata(stdout);
+        assert_eq!(invalid_lines, 0);
         assert_eq!(metadata.len(), 2);
         assert_eq!(metadata[0].id.as_deref(), Some("abc123"));
         assert_eq!(metadata[0].title.as_deref(), Some("日本語 \"タイトル\""));
@@ -1609,7 +1622,9 @@ mod tests {
             metadata[0].thumbnail.as_deref(),
             Some("https://example.com/thumb.jpg")
         );
-        assert!(parse_probe_metadata("{\"id\":\"abc123\"}\nnot-json").is_err());
+        let (metadata, invalid_lines) = parse_probe_metadata("{\"id\":\"abc123\"}\nnot-json");
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(invalid_lines, 1);
     }
 
     #[test]

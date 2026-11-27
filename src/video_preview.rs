@@ -33,16 +33,24 @@ pub(crate) struct VideoPreview {
     url: SharedString,
     thumbnail: Option<Thumbnail>,
     size: PreviewSize,
+    show_url: bool,
 }
 
 impl VideoPreview {
     pub(crate) fn from_item(item: &QueueItem, size: PreviewSize) -> Option<Self> {
+        let title = item.title().cloned();
+        let thumbnail = item.thumbnail().cloned();
+        if title.is_none() && thumbnail.is_none() {
+            return None;
+        }
+        let show_url = size == PreviewSize::Row && title.is_some();
         Some(Self {
             item_id: item.id(),
-            title: item.title()?.clone(),
+            title: title.unwrap_or_else(|| item.url().clone()),
             url: item.url().clone(),
-            thumbnail: item.thumbnail().cloned(),
+            thumbnail,
             size,
+            show_url,
         })
     }
 
@@ -136,9 +144,12 @@ impl RenderOnce for VideoPreview {
             .truncate()
             .child(self.title)
             .when(self.size == PreviewSize::Card, |this| this.text_sm());
-        let text = v_flex().flex_1().min_w_0().gap_0p5().child(title).when(
-            self.size == PreviewSize::Row,
-            |this| {
+        let text = v_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_0p5()
+            .child(title)
+            .when(self.show_url, |this| {
                 this.child(
                     div()
                         .text_xs()
@@ -147,8 +158,7 @@ impl RenderOnce for VideoPreview {
                         .truncate()
                         .child(display_url(self.url.as_ref())),
                 )
-            },
-        );
+            });
 
         h_flex()
             .w_full()

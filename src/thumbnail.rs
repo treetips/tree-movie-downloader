@@ -151,7 +151,7 @@ fn is_public_address(address: IpAddr) -> bool {
                 || (octets[0] == 100 && (64..=127).contains(&octets[1]))
                 || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
                 || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
-                || (octets[0] == 198 && octets[1] == 18)
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
                 || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
                 || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
                 || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113))
@@ -167,6 +167,7 @@ fn is_public_address(address: IpAddr) -> bool {
                 || address.is_unspecified()
                 || address.is_multicast()
                 || address.is_unique_local()
+                || (segments[0] & 0xffc0) == 0xfec0
                 || ipv4_compatible
                 || (segments[0] == 0x0100 && segments[1] == 0)
                 || (segments[0] == 0x0064 && segments[1] == 0xff9b)
@@ -282,7 +283,9 @@ mod tests {
         assert!(validate_thumbnail_url("http://127.0.0.1/image.png").is_err());
         assert!(validate_thumbnail_url("http://[::1]/image.png").is_err());
         assert!(validate_thumbnail_url("http://100.64.0.1/image.png").is_err());
+        assert!(validate_thumbnail_url("http://198.19.0.1/image.png").is_err());
         assert!(validate_thumbnail_url("http://[64:ff9b::7f00:1]/image.png").is_err());
+        assert!(validate_thumbnail_url("http://[fec0::1]/image.png").is_err());
         assert!(validate_thumbnail_url("https://localhost/image.png").is_err());
         assert!(validate_thumbnail_url("https://8.8.8.8/image.png").is_ok());
     }
