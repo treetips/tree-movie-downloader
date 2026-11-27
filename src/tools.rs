@@ -1,4 +1,4 @@
-//! yt-dlp と ffmpeg の配布バイナリを GitHub Releases から取得し、設定ディレクトリへ配置する。
+//! yt-dlp・ffmpeg・Deno の配布バイナリを GitHub Releases から取得し、設定ディレクトリへ配置する。
 //!
 //! アプリは外部ツールを同梱せず、起動時に不足しているバイナリをダウンロードする。
 //! 配布物の一覧は `tools-info.json` で管理し、取得した ZIP は SHA-256 で検証する。
@@ -31,6 +31,11 @@ const MAX_DOWNLOAD_RETRIES: u32 = 3;
 pub const YT_DLP: &str = "yt-dlp";
 /// ffmpeg のツール名。`tools-info.json` の `name` と一致させる。
 pub const FFMPEG: &str = "ffmpeg";
+/// Deno のツール名。`tools-info.json` の `name` と一致させる。
+pub const DENO: &str = "deno";
+
+/// 起動時に必要なツール。配布情報にも同じものを必須として含める。
+const REQUIRED_TOOLS: [&str; 3] = [YT_DLP, FFMPEG, DENO];
 
 /// バイナリを保存するディレクトリを上書きする環境変数。開発・テスト用。
 const TOOLS_DIR_ENV: &str = "TMD_TOOLS_DIR";
@@ -167,11 +172,17 @@ impl ToolPaths {
         self.tool_dir(FFMPEG)
     }
 
+    /// 管理下の Deno。
+    pub fn deno(&self) -> PathBuf {
+        self.binary(DENO, "deno")
+    }
+
     /// 必須バイナリがすべて実行可能な状態で存在するか。バージョンの一致までは見ない。
     pub fn is_complete(&self) -> bool {
         is_executable_file(&self.yt_dlp())
             && is_executable_file(&self.ffmpeg())
             && is_executable_file(&self.ffprobe())
+            && is_executable_file(&self.deno())
     }
 
     fn is_tool_complete(&self, name: &str) -> bool {
@@ -431,14 +442,19 @@ fn required_entries(info: &ToolsInfo, platform: Platform) -> Result<Vec<ToolEntr
         entries.push(entry.clone());
     }
 
-    for name in [YT_DLP, FFMPEG] {
+    for name in REQUIRED_TOOLS {
         if !entries.iter().any(|entry| entry.name == name) {
             return Err(format!(
                 "この環境（{platform_id}）向けの {name} が配布されていません。"
             ));
         }
     }
-    entries.sort_by_key(|entry| if entry.name == YT_DLP { 0 } else { 1 });
+    entries.sort_by_key(|entry| match entry.name.as_str() {
+        YT_DLP => 0,
+        FFMPEG => 1,
+        DENO => 2,
+        _ => 3,
+    });
     Ok(entries)
 }
 
@@ -699,6 +715,7 @@ fn expected_files(tool: &str) -> &'static [&'static str] {
     match tool {
         YT_DLP => &["yt-dlp"],
         FFMPEG => &["ffmpeg", "ffprobe"],
+        DENO => &["deno"],
         _ => &[],
     }
 }
@@ -711,7 +728,7 @@ fn executable_name(base: &str) -> String {
     }
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -845,6 +862,7 @@ mod tests {
         let info = info(vec![
             entry(YT_DLP, "macos-aarch64", true),
             entry(FFMPEG, "macos-aarch64", true),
+            entry(DENO, "macos-aarch64", true),
             entry(YT_DLP, "windows-x86_64", true),
             entry("optional", "macos-aarch64", false),
         ]);
@@ -855,7 +873,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![YT_DLP, FFMPEG]
+            vec![YT_DLP, FFMPEG, DENO]
         );
     }
 
@@ -868,11 +886,12 @@ mod tests {
         let info = info(vec![
             entry(YT_DLP, "macos-aarch64", true),
             entry(FFMPEG, "macos-aarch64", true),
+            entry(DENO, "macos-aarch64", true),
             entry("future-tool", "macos-aarch64", true),
         ]);
 
         let selected = required_entries(&info, platform).unwrap();
-        assert_eq!(selected.len(), 2);
+        assert_eq!(selected.len(), 3);
     }
 
     #[test]
@@ -888,6 +907,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_manifest_without_deno_for_the_platform() {
+        let platform = Platform {
+            os: "macos",
+            arch: "aarch64",
+        };
+        let info = info(vec![
+            entry(YT_DLP, "macos-aarch64", true),
+            entry(FFMPEG, "macos-aarch64", true),
+        ]);
+
+        let error = required_entries(&info, platform).unwrap_err();
+        assert!(error.contains(DENO));
+    }
+
+    #[test]
     fn rejects_a_manifest_with_an_invalid_checksum() {
         let platform = Platform {
             os: "macos",
@@ -895,7 +929,11 @@ mod tests {
         };
         let mut invalid = entry(YT_DLP, "macos-aarch64", true);
         invalid.sha256 = "not-a-checksum".to_string();
-        let info = info(vec![invalid, entry(FFMPEG, "macos-aarch64", true)]);
+        let info = info(vec![
+            invalid,
+            entry(FFMPEG, "macos-aarch64", true),
+            entry(DENO, "macos-aarch64", true),
+        ]);
 
         let error = required_entries(&info, platform).unwrap_err();
         assert!(error.contains("チェックサム"));
@@ -925,6 +963,45 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(destination.join("yt-dlp"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o755, 0o755);
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_files_without_execute_permission() {
+        let root = temp_dir("non-executable");
+        let binary = root.join("deno");
+        fs::write(&binary, b"binary").unwrap();
+
+        assert!(!is_executable_file(&binary));
+        set_executable(&binary).unwrap();
+        assert!(is_executable_file(&binary));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extracts_deno_and_sets_it_executable() {
+        let root = temp_dir("extract-deno");
+        let archive = root.join("deno.zip");
+        write_zip(&archive, &[("deno", b"binary"), ("README.md", b"readme")]);
+
+        let destination = root.join("staging");
+        fs::create_dir_all(&destination).unwrap();
+        extract_expected_files(&archive, &destination, DENO).unwrap();
+
+        assert_eq!(fs::read(destination.join("deno")).unwrap(), b"binary");
+        assert!(!destination.join("README.md").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(destination.join("deno"))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -967,6 +1044,7 @@ mod tests {
             Some("2026.10.26")
         );
         assert!(paths.installed_version(FFMPEG).is_none());
+        assert!(paths.installed_version(DENO).is_none());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -981,12 +1059,13 @@ mod tests {
         write_executable(&paths.yt_dlp(), b"old yt-dlp");
         write_executable(&paths.ffmpeg(), b"old ffmpeg");
         write_executable(&paths.ffprobe(), b"old ffprobe");
+        write_executable(&paths.deno(), b"old deno");
     }
 
-    fn record_versions(paths: &ToolPaths, yt_dlp: &str, ffmpeg: &str) {
+    fn record_versions(paths: &ToolPaths, yt_dlp: &str, ffmpeg: &str, deno: &str) {
         let mut installed = InstalledTools::default();
         let platform = Platform::current().unwrap().id();
-        for (name, version) in [(YT_DLP, yt_dlp), (FFMPEG, ffmpeg)] {
+        for (name, version) in [(YT_DLP, yt_dlp), (FFMPEG, ffmpeg), (DENO, deno)] {
             installed.set(
                 name,
                 InstalledTool {
@@ -1007,8 +1086,12 @@ mod tests {
         let root = temp_dir("up-to-date");
         let paths = ToolPaths::at(&root);
         write_complete_tools(&paths);
-        record_versions(&paths, "1.0.0", "1.0.0");
-        let entries = vec![current_entry(YT_DLP), current_entry(FFMPEG)];
+        record_versions(&paths, "1.0.0", "1.0.0", "1.0.0");
+        let entries = vec![
+            current_entry(YT_DLP),
+            current_entry(FFMPEG),
+            current_entry(DENO),
+        ];
 
         let pending = pending_entries(&paths, &paths.load_installed(), &entries);
 
@@ -1021,10 +1104,10 @@ mod tests {
         let root = temp_dir("version-change");
         let paths = ToolPaths::at(&root);
         write_complete_tools(&paths);
-        record_versions(&paths, "1.0.0", "1.0.0");
+        record_versions(&paths, "1.0.0", "1.0.0", "1.0.0");
         let mut yt_dlp = current_entry(YT_DLP);
         yt_dlp.version = "2.0.0".to_string();
-        let entries = vec![yt_dlp, current_entry(FFMPEG)];
+        let entries = vec![yt_dlp, current_entry(FFMPEG), current_entry(DENO)];
 
         let pending = pending_entries(&paths, &paths.load_installed(), &entries);
 
@@ -1038,9 +1121,13 @@ mod tests {
         let root = temp_dir("missing-binary");
         let paths = ToolPaths::at(&root);
         write_complete_tools(&paths);
-        record_versions(&paths, "1.0.0", "1.0.0");
+        record_versions(&paths, "1.0.0", "1.0.0", "1.0.0");
         fs::remove_file(paths.ffprobe()).unwrap();
-        let entries = vec![current_entry(YT_DLP), current_entry(FFMPEG)];
+        let entries = vec![
+            current_entry(YT_DLP),
+            current_entry(FFMPEG),
+            current_entry(DENO),
+        ];
 
         let pending = pending_entries(&paths, &paths.load_installed(), &entries);
 
@@ -1050,14 +1137,34 @@ mod tests {
     }
 
     #[test]
+    fn selects_deno_when_its_binary_is_missing() {
+        let root = temp_dir("missing-deno");
+        let paths = ToolPaths::at(&root);
+        write_complete_tools(&paths);
+        record_versions(&paths, "1.0.0", "1.0.0", "1.0.0");
+        fs::remove_file(paths.deno()).unwrap();
+        let entries = vec![
+            current_entry(YT_DLP),
+            current_entry(FFMPEG),
+            current_entry(DENO),
+        ];
+
+        let pending = pending_entries(&paths, &paths.load_installed(), &entries);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, DENO);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn selects_a_tool_when_its_recorded_platform_differs() {
         let root = temp_dir("platform-change");
         let paths = ToolPaths::at(&root);
         write_complete_tools(&paths);
-        record_versions(&paths, "1.0.0", "1.0.0");
+        record_versions(&paths, "1.0.0", "1.0.0", "1.0.0");
         let mut yt_dlp = current_entry(YT_DLP);
         yt_dlp.platform = "another-platform".to_string();
-        let entries = vec![yt_dlp, current_entry(FFMPEG)];
+        let entries = vec![yt_dlp, current_entry(FFMPEG), current_entry(DENO)];
 
         let pending = pending_entries(&paths, &paths.load_installed(), &entries);
 
@@ -1071,7 +1178,7 @@ mod tests {
         let root = temp_dir("check-updates");
         let paths = ToolPaths::at(&root);
         write_complete_tools(&paths);
-        record_versions(&paths, "1.0.0", "1.0.0");
+        record_versions(&paths, "1.0.0", "1.0.0", "1.0.0");
         let platform = Platform::current().unwrap().id();
         let manifest = serde_json::json!({
             "schemaVersion": 1,
@@ -1090,6 +1197,14 @@ mod tests {
                     "platform": platform,
                     "url": "https://example.com/ffmpeg.zip",
                     "sha256": "b".repeat(64),
+                    "required": true
+                },
+                {
+                    "name": DENO,
+                    "version": "1.0.0",
+                    "platform": platform,
+                    "url": "https://example.com/deno.zip",
+                    "sha256": "c".repeat(64),
                     "required": true
                 }
             ]
@@ -1110,7 +1225,7 @@ mod tests {
         let root = temp_dir("empty-selection");
         let paths = ToolPaths::at(&root);
         write_complete_tools(&paths);
-        record_versions(&paths, "1.0.0", "1.0.0");
+        record_versions(&paths, "1.0.0", "1.0.0", "1.0.0");
         let (sender, receiver) = smol::channel::unbounded();
 
         install_tool_updates(paths, Vec::new(), sender);
@@ -1181,7 +1296,7 @@ mod tests {
         let (url, server) = serve_once(bytes.clone());
         let paths = ToolPaths::at(root.join("tools"));
         write_complete_tools(&paths);
-        record_versions(&paths, "1.0.0", "1.0.0");
+        record_versions(&paths, "1.0.0", "1.0.0", "1.0.0");
         let entry = ToolEntry {
             name: YT_DLP.to_string(),
             version: "2.0.0".to_string(),
@@ -1197,9 +1312,11 @@ mod tests {
         assert_eq!(fs::read(paths.yt_dlp()).unwrap(), b"new yt-dlp");
         assert_eq!(fs::read(paths.ffmpeg()).unwrap(), b"old ffmpeg");
         assert_eq!(fs::read(paths.ffprobe()).unwrap(), b"old ffprobe");
+        assert_eq!(fs::read(paths.deno()).unwrap(), b"old deno");
         let installed = paths.load_installed();
         assert_eq!(installed.get(YT_DLP).unwrap().version, "2.0.0");
         assert_eq!(installed.get(FFMPEG).unwrap().version, "1.0.0");
+        assert_eq!(installed.get(DENO).unwrap().version, "1.0.0");
         server.join().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -1250,6 +1367,14 @@ mod tests {
                     "url": "https://example.com/ffmpeg.zip",
                     "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "required": true
+                },
+                {
+                    "name": "deno",
+                    "version": "v2.9.8",
+                    "platform": "macos-aarch64",
+                    "url": "https://example.com/deno.zip",
+                    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "required": true
                 }
             ]
         }"#;
@@ -1264,11 +1389,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].name, YT_DLP);
         assert_eq!(entries[0].version, "2026.10.26");
         assert_eq!(entries[1].name, FFMPEG);
         assert_eq!(entries[1].version, "b6.1.1");
+        assert_eq!(entries[2].name, DENO);
+        assert_eq!(entries[2].version, "v2.9.8");
     }
 
     #[test]

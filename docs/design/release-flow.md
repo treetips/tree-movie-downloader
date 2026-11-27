@@ -2,7 +2,7 @@
 
 ## 目的
 
-ビルド済みのアプリ本体と、アプリが取得する外部ツール（yt-dlp、ffmpeg/ffprobe）を、それぞれ GitHub Releases で配布する。アプリ本体の更新とライブラリの更新を分離し、ツールだけを差し替えられる状態にする。
+ビルド済みのアプリ本体と、アプリが取得する外部ツール（yt-dlp、ffmpeg/ffprobe、Deno）を、それぞれ GitHub Releases で配布する。アプリ本体の更新とライブラリの更新を分離し、ツールだけを差し替えられる状態にする。
 
 ## CI
 
@@ -25,8 +25,8 @@
 2. **Run workflow** を押し、`bump`（`major` / `minor` / `patch`）を選ぶ。
    - 初回リリース（`v*` タグが無い場合）は `Cargo.toml` のバージョンをそのまま使う。
 3. 最新の `v*` タグと `bump` から次のバージョンを算出し、同じタグが無いことを確認する。
-4. `tools-latest` の `tools-info.json` が取得できることを確認する。
-   - 取得できない場合はリリースを停止する。先に **Release Tools** を実行する。
+4. `tools-latest` の `tools-info.json` を取得し、macOS の両アーキテクチャ向けに yt-dlp・ffmpeg・Deno が必須ツールとして含まれることを確認する。
+   - 取得できない場合や Deno が欠けている場合はリリースを停止する。先に **Release Tools** を実行する。
 5. `cargo test --locked` と `cargo build --release --locked` を実行する。
    - 表示バージョンは `TMD_APP_VERSION` としてビルド時に注入する。
 6. `.app` を組み立てる。
@@ -52,13 +52,14 @@
 
 ## ツール配布フロー
 
-外部ツールはアプリ本体とは別の `tools-latest` リリースで配布する。アプリ本体のバージョンやリリースタイミングには依存しない。アプリ本体のリリース前に、こちらを先に実行しておく。
+外部ツールはアプリ本体とは別の `tools-latest` リリースで配布する。アプリ本体のバージョンやリリースタイミングには依存しない。アプリ本体のリリース前に、こちらを先に実行しておく。Deno を必須にするアプリを公開する際は、Deno を含む配布情報を先に公開する。
 
 1. GitHub の **Actions** タブで **Release Tools** を選ぶ。
 2. **Run workflow** を押す。
    - `tag`: 配布先のリリースタグ（既定は `tools-latest`）
    - `yt_dlp_version`: yt-dlp のバージョン（空なら最新）
    - `ffmpeg_static_tag`: `eugeneware/ffmpeg-static` のタグ（空なら最新）
+   - `deno_version`: Deno のバージョン（空なら最新）
    - `force`: 上流の更新がなくても配布物を再作成するか（既定は `false`）
 3. preflight が上流の version / tag を1回だけ解決し、配布先の既存 `tools-info.json` と比較する。
    - 入力が空でない場合は指定値を使い、空の場合だけ上流 API から最新値を解決する。
@@ -79,6 +80,7 @@
 - ツール情報: `tools-info.json`
 - yt-dlp: `yt-dlp-<platform>-<version>.zip`
 - ffmpeg: `ffmpeg-<platform>-<version>.zip`（`ffmpeg` と `ffprobe` を含む）
+- Deno: `deno-<platform>-<version>.zip`（`deno` または `deno.exe` とライセンスを含む）
 - チェックサム: `SHA256SUMS.txt`
 
 対象プラットフォームは次のとおり。
@@ -95,6 +97,7 @@
 
 - yt-dlp: [yt-dlp/yt-dlp の Releases](https://github.com/yt-dlp/yt-dlp/releases)
 - ffmpeg: [eugeneware/ffmpeg-static の Releases](https://github.com/eugeneware/ffmpeg-static/releases)
+- Deno: [denoland/deno の Releases](https://github.com/denoland/deno/releases)
 
 ## 失敗時の対応
 

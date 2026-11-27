@@ -15,6 +15,10 @@ on:
         description: 'eugeneware/ffmpeg-static のタグ（空なら最新）'
         required: false
         default: ''
+      deno_version:
+        description: 'Deno のバージョン（空なら最新）'
+        required: false
+        default: ''
       force:
         description: '上流の更新がなくても配布物を再作成する'
         required: false
@@ -46,6 +50,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           YT_DLP_VERSION: ${{ inputs.yt_dlp_version }}
           FFMPEG_STATIC_TAG: ${{ inputs.ffmpeg_static_tag }}
+          DENO_VERSION: ${{ inputs.deno_version }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
@@ -59,12 +64,14 @@ jobs:
           REPO_URL: https://github.com/${{ github.repository }}
           YT_DLP_VERSION: ${{ steps.preflight.outputs.yt_dlp_version }}
           FFMPEG_STATIC_TAG: ${{ steps.preflight.outputs.ffmpeg_static_tag }}
+          DENO_VERSION: ${{ steps.preflight.outputs.deno_version }}
         run: |
           set -euo pipefail
           : "${YT_DLP_VERSION:?preflight の yt-dlp バージョンが空です}"
           : "${FFMPEG_STATIC_TAG:?preflight の ffmpeg-static タグが空です}"
+          : "${DENO_VERSION:?preflight の Deno バージョンが空です}"
           chmod +x tools/build-release-assets.sh
-          tools/build-release-assets.sh dist-tools "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG"
+          tools/build-release-assets.sh dist-tools "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG" "$DENO_VERSION"
 
       - name: Publish GitHub Release
         if: steps.preflight.outputs.changed == 'true'

@@ -124,10 +124,46 @@ jobs:
         run: |
           set -euo pipefail
           URL="$REPO_URL/releases/download/tools-latest/tools-info.json"
-          if ! curl -fsSL --retry 3 --connect-timeout 10 -o /dev/null "$URL"; then
+          MANIFEST="$RUNNER_TEMP/tools-info.json"
+          if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$MANIFEST" "$URL"; then
             echo "::error::tools-latest の tools-info.json を取得できません。先に Release Tools ワークフローを実行してください。"
             exit 1
           fi
+          python3 - "$MANIFEST" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          try:
+              data = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError) as error:
+              raise SystemExit(f"tools-info.json を読み込めません: {error}")
+          if (
+              not isinstance(data, dict)
+              or type(data.get("schemaVersion")) is not int
+              or data["schemaVersion"] != 1
+              or not isinstance(data.get("tools"), list)
+          ):
+              raise SystemExit("tools-info.json の形式が不正です")
+          required = {
+              (entry.get("name"), entry.get("platform"))
+              for entry in data["tools"]
+              if isinstance(entry, dict) and entry.get("required") is True
+          }
+          expected = {
+              (name, platform)
+              for name in ("yt-dlp", "ffmpeg", "deno")
+              for platform in ("macos-aarch64", "macos-x86_64")
+          }
+          missing = expected - required
+          if missing:
+              raise SystemExit(
+                  "tools-latest に必要なツールがありません: "
+                  + ", ".join(f"{name}/{platform}" for name, platform in sorted(missing))
+                  + "。先に Release Tools ワークフローを実行してください。"
+              )
+          PY
 
       - name: Run tests
         run: cargo test --locked
@@ -261,9 +297,11 @@ jobs:
           echo "Created: $DIST/$ZIP_NAME"
           cat "$DIST/update-info.json"
           cat "$DIST/SHA256SUMS.txt"
-          echo "zip_path=$DIST/$ZIP_NAME" >> "$GITHUB_OUTPUT"
-          echo "checksum_path=$DIST/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
-          echo "update_info_path=$DIST/update-info.json" >> "$GITHUB_OUTPUT"
+          {
+            echo "zip_path=$DIST/$ZIP_NAME"
+            echo "checksum_path=$DIST/SHA256SUMS.txt"
+            echo "update_info_path=$DIST/update-info.json"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create and push Git tag
         shell: bash

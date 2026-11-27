@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ビルド済みの yt-dlp / ffmpeg 配布物を GitHub Releases へ公開する。
+# ビルド済みの yt-dlp / ffmpeg / Deno 配布物を GitHub Releases へ公開する。
 #
 # 使い方:
 #   tools/publish-tools-release.sh <output-dir>
@@ -12,6 +12,7 @@ set -euo pipefail
 OUT_DIR="${1:?成果物ディレクトリを指定してください}"
 TAG="${TAG:-tools-latest}"
 GH_TOKEN="${GH_TOKEN:?GitHub 認証トークンを指定してください}"
+RELEASE_NOTES="yt-dlp、ffmpeg、Deno の配布物です。アプリが起動時に取得します。"
 
 [[ "$TAG" == tools-* ]] || {
   echo "::error::TAG は tools- で始まる名前を指定してください: $TAG" >&2
@@ -43,16 +44,16 @@ done
 }
 
 if gh release view "$TAG" >/dev/null 2>&1; then
-  echo "Release $TAG already exists; replacing assets."
+  echo "Release $TAG は既存です。成果物を置き換えます。"
 else
   gh release create "$TAG" \
     --title "Tools" \
-    --notes "yt-dlp と ffmpeg の配布物です。アプリが起動時に取得します。" \
+    --notes "$RELEASE_NOTES" \
     --prerelease
 fi
 # ツール配布用リリースが GitHub の「Latest」になり、アプリ本体の
 # 更新確認（releases/latest）を隠さないように prerelease を維持する。
-gh release edit "$TAG" --prerelease
+gh release edit "$TAG" --prerelease --notes "$RELEASE_NOTES"
 
 keep_assets=" "
 for file in "${binary_assets[@]}" "${metadata_assets[@]}"; do

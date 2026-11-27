@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# yt-dlp と ffmpeg の配布物を GitHub Releases へアップロードできる形にまとめる。
+# yt-dlp、ffmpeg、Deno の配布物を GitHub Releases へアップロードできる形にまとめる。
 #
 # 使い方:
-#   tools/build-release-assets.sh <output-dir> [yt-dlp-version] [ffmpeg-static-tag]
+#   tools/build-release-assets.sh <output-dir> [yt-dlp-version] [ffmpeg-static-tag] [deno-version]
 #
 # 環境変数:
-#   REPO_URL  GitHub リポジトリの URL（既定: https://github.com/treetips/tree-movie-downloader）
-#   TAG       配布先のリリースタグ（既定: tools-latest）
+#   REPO_URL           GitHub リポジトリの URL（既定: https://github.com/treetips/tree-movie-downloader）
+#   TAG                配布先のリリースタグ（既定: tools-latest）
+#   YT_DLP_VERSION     引数省略時の yt-dlp バージョン
+#   FFMPEG_STATIC_TAG  引数省略時の ffmpeg-static タグ
+#   DENO_VERSION       引数省略時の Deno バージョン
 set -euo pipefail
 
 OUT_DIR="${1:?出力先ディレクトリを指定してください}"
 YT_DLP_VERSION="${2:-${YT_DLP_VERSION:-}}"
 FFMPEG_STATIC_TAG="${3:-${FFMPEG_STATIC_TAG:-}}"
+DENO_VERSION="${4:-${DENO_VERSION:-}}"
 REPO_URL="${REPO_URL:-https://github.com/treetips/tree-movie-downloader}"
 TAG="${TAG:-tools-latest}"
 
@@ -37,12 +41,27 @@ if [[ -z "$FFMPEG_STATIC_TAG" ]]; then
   FFMPEG_STATIC_TAG="$(curl -fsSL https://api.github.com/repos/eugeneware/ffmpeg-static/releases/latest \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
 fi
+if [[ -z "$DENO_VERSION" ]]; then
+  DENO_VERSION="$(curl -fsSL https://api.github.com/repos/denoland/deno/releases/latest \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+fi
+
+python3 - "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG" "$DENO_VERSION" <<'PY'
+import re
+import sys
+
+for label, value in zip(("yt-dlp", "ffmpeg-static", "Deno"), sys.argv[1:]):
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", value) is None:
+        raise SystemExit(f"{label} のバージョンに不正な文字が含まれています")
+PY
 
 echo "yt-dlp: $YT_DLP_VERSION"
 echo "ffmpeg-static: $FFMPEG_STATIC_TAG"
+echo "Deno: $DENO_VERSION"
 
 YT_DLP_BASE="https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}"
 FFMPEG_BASE="https://github.com/eugeneware/ffmpeg-static/releases/download/${FFMPEG_STATIC_TAG}"
+DENO_BASE="https://github.com/denoland/deno/releases/download/${DENO_VERSION}"
 
 # yt-dlp は macOS 向けだけ universal2 の単一バイナリなので、両アーキテクチャで同じものを使う。
 YT_DLP_STAGE="$WORK_DIR/yt-dlp"
@@ -98,7 +117,52 @@ package_ffmpeg "windows-x86_64" "ffmpeg-win32-x64" "ffprobe-win32-x64" "ffmpeg.e
 package_ffmpeg "linux-x86_64" "ffmpeg-linux-x64" "ffprobe-linux-x64" "ffmpeg" "ffprobe"
 package_ffmpeg "linux-aarch64" "ffmpeg-linux-arm64" "ffprobe-linux-arm64" "ffmpeg" "ffprobe"
 
-python3 - "$OUT_DIR" "$REPO_URL" "$TAG" "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG" <<'PY'
+download "https://raw.githubusercontent.com/denoland/deno/${DENO_VERSION}/LICENSE.md" "$WORK_DIR/deno-LICENSE"
+
+package_deno() {
+  local platform="$1"
+  local deno_asset="$2"
+  local binary_name="$3"
+  local upstream="$WORK_DIR/deno-${platform}-upstream.zip"
+  local stage="$WORK_DIR/deno-$platform"
+
+  mkdir -p "$stage"
+  download "${DENO_BASE}/${deno_asset}" "$upstream"
+  # 上流 ZIP のルートにある実行ファイルだけを取り出す。
+  python3 - "$upstream" "$binary_name" "$stage/$binary_name" <<'PY'
+import pathlib
+import shutil
+import sys
+import zipfile
+
+archive_path = pathlib.Path(sys.argv[1])
+binary_name = sys.argv[2]
+output_path = pathlib.Path(sys.argv[3])
+with zipfile.ZipFile(archive_path) as archive:
+    matches = [
+        info
+        for info in archive.infolist()
+        if info.filename == binary_name and not info.is_dir()
+    ]
+    if len(matches) != 1:
+        raise SystemExit(f"Deno ZIP にルートの {binary_name} がありません: {archive_path}")
+    with archive.open(matches[0]) as source, output_path.open("wb") as output:
+        shutil.copyfileobj(source, output)
+PY
+  cp "$WORK_DIR/deno-LICENSE" "$stage/LICENSE"
+  if [[ "$platform" != windows-* ]]; then
+    chmod +x "$stage/$binary_name"
+  fi
+  (cd "$stage" && zip -j -q "$OUT_DIR/deno-${platform}-${DENO_VERSION}.zip" "$binary_name" LICENSE)
+}
+
+package_deno "macos-aarch64" "deno-aarch64-apple-darwin.zip" "deno"
+package_deno "macos-x86_64" "deno-x86_64-apple-darwin.zip" "deno"
+package_deno "windows-x86_64" "deno-x86_64-pc-windows-msvc.zip" "deno.exe"
+package_deno "linux-x86_64" "deno-x86_64-unknown-linux-gnu.zip" "deno"
+package_deno "linux-aarch64" "deno-aarch64-unknown-linux-gnu.zip" "deno"
+
+python3 - "$OUT_DIR" "$REPO_URL" "$TAG" "$YT_DLP_VERSION" "$FFMPEG_STATIC_TAG" "$DENO_VERSION" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -109,6 +173,7 @@ repo_url = sys.argv[2].rstrip("/")
 tag = sys.argv[3]
 yt_dlp_version = sys.argv[4]
 ffmpeg_version = sys.argv[5]
+deno_version = sys.argv[6]
 platforms = [
     "macos-aarch64",
     "macos-x86_64",
@@ -122,6 +187,7 @@ for platform in platforms:
     for name, version, filename in (
         ("yt-dlp", yt_dlp_version, f"yt-dlp-{platform}-{yt_dlp_version}.zip"),
         ("ffmpeg", ffmpeg_version, f"ffmpeg-{platform}-{ffmpeg_version}.zip"),
+        ("deno", deno_version, f"deno-{platform}-{deno_version}.zip"),
     ):
         asset = out / filename
         if not asset.is_file():
