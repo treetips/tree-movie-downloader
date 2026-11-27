@@ -11,12 +11,12 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IndexPath, Selectable as _, Sizable as _, StyledExt as _, TitleBar,
     WindowExt as _,
     alert::Alert,
-    button::{Button, ButtonVariant, ButtonVariants},
+    button::{Button, ButtonCustomVariant, ButtonVariant, ButtonVariants},
     h_flex,
     input::{Textarea, TextareaState},
     link::Link,
     notification::Notification,
-    progress::Progress,
+    progress::{Progress, ProgressCircle},
     select::{Select, SelectEvent, SelectState},
     separator::Separator,
     spinner::Spinner,
@@ -481,7 +481,7 @@ impl AppView {
                                         .text_xs()
                                         .text_color(dialog_cx.theme().muted_foreground)
                                         .child(
-                                            "http:// または https:// で始まるURLを1行に1件ずつ貼り付けてください。動画・チャンネル・プレイリストに対応します。これらで始まらない行は追加しません。動画URLに list= が付いている場合は、その動画だけをダウンロードします。",
+                                            "http:// または https:// で始まるURLを1行に1件ずつ貼り付けてください。動画・チャンネル・プレイリストに対応します。これらで始まらない行は追加しません。動画URLに list= が付いている場合は、その動画だけをダウンロードします。同じURLは重複して追加できません。",
                                         ),
                                 )
                                 .child(
@@ -581,7 +581,7 @@ impl AppView {
                                     if added == 0 {
                                         window.push_notification(
                                             Notification::warning(
-                                                "http:// または https:// で始まるURLを1行に1件入力してください",
+                                                "追加できるURLがありません。URLの形式や重複を確認してください。",
                                             ),
                                             cx,
                                         );
@@ -1070,142 +1070,237 @@ impl AppView {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(format!("v{}", APP_VERSION)),
-                )
-                .child(self.render_update_area(cx)),
+                ),
         )
     }
 
-    /// タイトルバー右端の更新エリア。
+    /// ヘッダー下の右上に重ねる更新通知。
     fn render_update_area(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (state, library_state, available_label, no_update_visible) = {
+        let (
+            state,
+            library_state,
+            available_label,
+            no_update_visible,
+            app_visible,
+            library_visible,
+        ) = {
             let controller = self.update_controller.read(cx);
             (
                 controller.state().clone(),
                 controller.library_state().clone(),
                 controller.available_update_label(),
                 controller.no_update_visible(),
+                controller.is_app_update_notification_visible(),
+                controller.is_library_update_notification_visible(),
             )
         };
-
-        if matches!(state, UpdateState::Checking)
-            || matches!(library_state, LibraryUpdateState::Checking)
-        {
-            return h_flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .bg(cx.theme().muted.opacity(0.35))
-                .child(Spinner::new().xsmall().color(cx.theme().muted_foreground))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("アップデートを確認中"),
-                )
-                .into_any_element();
-        }
-
-        let install_progress = match (&state, &library_state) {
-            (UpdateState::Installing(phase), _) => Some((phase.label(), phase.percent())),
-            (_, LibraryUpdateState::Installing(phase)) => Some((phase.label(), phase.percent())),
-            _ => None,
-        };
-        if let Some((label, percent)) = install_progress {
-            let determinate = percent.is_some();
-            return v_flex()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .bg(cx.theme().primary.opacity(0.12))
-                .min_w(px(200.))
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(Spinner::new().xsmall().color(cx.theme().primary))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_medium()
-                                .text_color(cx.theme().primary)
-                                .child(format!("インストール中 {label}")),
-                        ),
-                )
-                .child(
-                    Progress::new("title-update-progress")
-                        .value(percent.unwrap_or(0.0))
-                        .loading(!determinate)
-                        .h(px(3.)),
-                )
-                .into_any_element();
-        }
-
-        if matches!(state, UpdateState::Failed(_))
-            || matches!(library_state, LibraryUpdateState::Failed(_))
-        {
-            return h_flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .bg(cx.theme().danger.opacity(0.12))
-                .child(
-                    Icon::new(IconName::CircleAlert)
-                        .xsmall()
-                        .text_color(cx.theme().danger),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(cx.theme().danger)
-                        .child("インストールに失敗"),
-                )
-                .child(
-                    Button::new("retry-update-title")
-                        .xsmall()
-                        .label("再実行")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.retry_update(window, cx);
-                        })),
-                )
-                .into_any_element();
-        }
-
-        if let Some(label) = available_label {
-            return Button::new("update-area-available")
-                .info()
-                .small()
-                .icon(IconName::Download)
-                .label(label)
-                .bg(cx.theme().blue)
-                .text_color(cx.theme().background)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_update_dialog(window, cx);
-                }))
-                .into_any_element();
-        }
-
-        if no_update_visible {
-            Button::new("update-area-uptodate")
-                .ghost()
-                .small()
-                .icon(IconName::Check)
-                .label("アップデートは有りません")
-                .bg(cx.theme().muted.opacity(0.35))
-                .text_color(cx.theme().foreground)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.update_controller
-                        .update(cx, |controller, cx| controller.dismiss(cx));
-                }))
-                .into_any_element()
+        let state = if app_visible {
+            state
         } else {
-            div().into_any_element()
-        }
+            UpdateState::Idle
+        };
+        let library_state = if library_visible {
+            library_state
+        } else {
+            LibraryUpdateState::Idle
+        };
+
+        let (tint, opacity, content): (Hsla, f32, AnyElement) = if state.is_checking()
+            || library_state.is_checking()
+        {
+            let color = cx.theme().muted_foreground;
+            (
+                cx.theme().muted,
+                0.35,
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        ProgressCircle::new("update-checking")
+                            .loading(true)
+                            .size_5()
+                            .color(color)
+                            .accessibility_label("アップデートを確認中"),
+                    )
+                    .child(div().text_sm().font_medium().child("アップデートを確認中"))
+                    .into_any_element(),
+            )
+        } else if let Some((label, percent, color)) = match (&state, &library_state) {
+            (UpdateState::Installing(phase), _) => Some((
+                phase.status_label().to_string(),
+                phase.percent(),
+                cx.theme().blue,
+            )),
+            (_, LibraryUpdateState::Installing(phase)) => {
+                Some((phase.status_label(), phase.percent(), cx.theme().primary))
+            }
+            _ => None,
+        } {
+            let mut row = h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    ProgressCircle::new("update-install-progress")
+                        .loading(percent.is_none())
+                        .value(percent.unwrap_or(0.0))
+                        .size_5()
+                        .color(color)
+                        .accessibility_label("アップデートのインストール進捗"),
+                )
+                .child(div().text_sm().font_medium().child(label));
+            if let Some(percent) = percent {
+                row = row.child(
+                    div()
+                        .min_w_10()
+                        .text_right()
+                        .text_sm()
+                        .font_medium()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("{percent:.0}%")),
+                );
+            }
+            (color, 0.3, row.into_any_element())
+        } else if matches!(&state, UpdateState::Failed(_))
+            || matches!(&library_state, LibraryUpdateState::Failed(_))
+        {
+            let color = cx.theme().danger;
+            (
+                color,
+                0.3,
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::update_status_icon(IconName::CircleAlert, color))
+                    .child(div().text_sm().font_medium().child("インストールに失敗"))
+                    .child(
+                        Self::update_action_button("retry-update-title", "再実行", color, cx)
+                            .disabled(self.running)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.retry_update(window, cx);
+                            })),
+                    )
+                    .child(self.update_close_button(cx))
+                    .into_any_element(),
+            )
+        } else if let Some(label) = available_label {
+            let color = cx.theme().blue;
+            (
+                color,
+                0.35,
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::update_status_icon(IconName::Download, color))
+                    .child(div().text_sm().font_medium().child(label))
+                    .child(
+                        Self::update_action_button(
+                            "update-area-install",
+                            "インストール…",
+                            color,
+                            cx,
+                        )
+                        .disabled(self.running)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_update_dialog(window, cx);
+                        })),
+                    )
+                    .child(self.update_close_button(cx))
+                    .into_any_element(),
+            )
+        } else if no_update_visible {
+            (
+                cx.theme().muted,
+                0.05,
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::update_status_icon(
+                        IconName::CircleCheck,
+                        cx.theme().success,
+                    ))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .child("アップデートは有りません"),
+                    )
+                    .child(self.update_close_button(cx))
+                    .into_any_element(),
+            )
+        } else {
+            return div().into_any_element();
+        };
+
+        h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .min_h_9()
+            .rounded_full()
+            .border_1()
+            .border_color(tint.opacity(0.18))
+            .bg(tint.opacity(opacity))
+            .text_color(cx.theme().foreground)
+            .shadow_sm()
+            .child(content)
+            .into_any_element()
+    }
+
+    fn update_close_button(&self, cx: &mut Context<Self>) -> Button {
+        Button::new("dismiss-update-notification")
+            .small()
+            .icon(IconName::Close)
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(cx.theme().muted.opacity(0.4))
+                    .foreground(cx.theme().muted_foreground)
+                    .hover(cx.theme().muted.opacity(0.18))
+                    .active(cx.theme().muted.opacity(0.3)),
+            )
+            .rounded_full()
+            .p_0()
+            .tooltip("閉じる")
+            .accessibility_label("閉じる")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.update_controller
+                    .update(cx, |controller, cx| controller.dismiss_notification(cx));
+            }))
+    }
+
+    fn update_status_icon(icon: IconName, color: Hsla) -> impl IntoElement {
+        div()
+            .size_6()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(color.opacity(0.18))
+            .child(Icon::new(icon).small().text_color(color))
+    }
+
+    fn update_action_button(
+        id: &'static str,
+        label: &'static str,
+        color: Hsla,
+        cx: &App,
+    ) -> Button {
+        Button::new(id)
+            .small()
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(color)
+                    .foreground(color)
+                    .hover(color.opacity(0.35))
+                    .active(color.opacity(0.5)),
+            )
+            .label(label)
+            .font_semibold()
+            .rounded_full()
+            .border_1()
+            .border_color(color.opacity(0.18))
+            .shadow_none()
     }
 
     /// 初回起動時など、ツールが揃うまでのダウンロード画面。
@@ -1843,11 +1938,18 @@ impl Render for AppView {
                                 .child(layers),
                         )
                     })
-                    .child(div().size_full().child(if tools_ready {
+                    .child(div().size_full().pt_3().child(if tools_ready {
                         page_content
                     } else {
                         self.render_tool_bootstrap(cx).into_any_element()
-                    })),
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_1()
+                            .right_3()
+                            .child(self.render_update_area(cx)),
+                    ),
             )
             .when(tools_ready, |this| {
                 this.child(self.render_status_bar(

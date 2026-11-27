@@ -22,9 +22,10 @@ use crate::model::{
     AudioQuality, Container, DEFAULT_QUALITY, ItemStatus, Quality, QueueEvent, QueueItem,
     QueueModel, Site, compact_url, display_url,
 };
+use crate::video_preview::{PreviewSize, VideoPreview};
 
 const W_STATUS: f32 = 72.;
-const W_URL: f32 = 188.;
+const W_URL: f32 = 240.;
 const W_QUALITY: f32 = 92.;
 const W_AUDIO: f32 = 88.;
 const W_CONTAINER: f32 = 92.;
@@ -757,6 +758,10 @@ fn status_cell(item: &QueueItem, cx: &App) -> AnyElement {
 }
 
 fn url_cell(item: &QueueItem, cx: &App) -> AnyElement {
+    if let Some(preview) = VideoPreview::from_item(item, PreviewSize::Row) {
+        return preview.into_any_element();
+    }
+
     v_flex()
         .justify_center()
         .gap_0p5()

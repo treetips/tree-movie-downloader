@@ -1,7 +1,7 @@
 //! アプリ本体とライブラリの更新状態・ダイアログ。
 //!
 //! 通信とファイル操作は [`crate::updater`] と [`crate::tools`] が担い、ここでは
-//! 2種類の更新を独立した状態として保持し、タイトルバー・About・確認ダイアログへ反映する。
+//! 2種類の更新を独立した状態として保持し、更新通知・About・確認ダイアログへ反映する。
 
 use std::time::Duration;
 
@@ -42,6 +42,15 @@ impl InstallPhase {
             Self::Verifying => "ダウンロードを検証中".to_string(),
             Self::Extracting => "展開中".to_string(),
             Self::Placing => "アプリを配置中".to_string(),
+        }
+    }
+
+    pub fn status_label(&self) -> &'static str {
+        match self {
+            Self::Downloading { .. } => "ダウンロード中",
+            Self::Verifying => "ダウンロードを検証中",
+            Self::Extracting => "展開中",
+            Self::Placing => "アプリを配置中",
         }
     }
 
@@ -116,6 +125,17 @@ impl LibraryInstallPhase {
         }
     }
 
+    pub fn status_label(&self) -> String {
+        match self {
+            Self::Downloading {
+                tool, step, steps, ..
+            } => format!("{tool} をダウンロード中 ({step}/{steps})"),
+            Self::Installing { tool, step, steps } => {
+                format!("{tool} を配置中 ({step}/{steps})")
+            }
+        }
+    }
+
     pub fn percent(&self) -> Option<f32> {
         match self {
             Self::Downloading {
@@ -168,7 +188,6 @@ enum InstallPlan {
 struct PreviousUpdateState {
     app: UpdateState,
     library: LibraryUpdateState,
-    no_update_visible: bool,
 }
 
 /// 更新状態を保持し、アプリ本体とライブラリの確認・インストールを調整する。
@@ -178,6 +197,8 @@ pub struct UpdateController {
     available: Option<UpdateInfo>,
     available_tools: Vec<ToolEntry>,
     no_update_visible: bool,
+    app_notification_dismissed: bool,
+    library_notification_dismissed: bool,
     hide_task: Option<Task<()>>,
     install_app_after_library: bool,
     library_background_started: bool,
@@ -194,6 +215,8 @@ impl UpdateController {
             available: None,
             available_tools: Vec::new(),
             no_update_visible: false,
+            app_notification_dismissed: false,
+            library_notification_dismissed: false,
             hide_task: None,
             install_app_after_library: false,
             library_background_started: false,
@@ -242,7 +265,17 @@ impl UpdateController {
         matches!(self.library_state, LibraryUpdateState::Available(_))
     }
 
-    /// タイトルバーの更新ボタンに表示する文案。
+    /// アプリ更新の通知を表示できるか。閉じても更新自体の状態は保持する。
+    pub fn is_app_update_notification_visible(&self) -> bool {
+        !self.app_notification_dismissed
+    }
+
+    /// ライブラリ更新の通知を表示できるか。閉じても更新自体の状態は保持する。
+    pub fn is_library_update_notification_visible(&self) -> bool {
+        !self.library_notification_dismissed
+    }
+
+    /// 更新通知に表示する更新ありの文案。
     pub fn available_update_label(&self) -> Option<&'static str> {
         if (!self.library_check_completed && !self.library_check_unavailable)
             || matches!(self.state, UpdateState::CheckFailed(_))
@@ -251,7 +284,10 @@ impl UpdateController {
         {
             return None;
         }
-        Self::label_for(self.has_app_update(), self.has_library_update())
+        Self::label_for(
+            self.has_app_update() && self.is_app_update_notification_visible(),
+            self.has_library_update() && self.is_library_update_notification_visible(),
+        )
     }
 
     fn label_for(app: bool, library: bool) -> Option<&'static str> {
@@ -272,7 +308,7 @@ impl UpdateController {
         }
     }
 
-    /// 更新なしのタイトルバー表示を出しているか。
+    /// 更新なしの通知を出しているか。
     pub fn no_update_visible(&self) -> bool {
         self.no_update_visible
     }
@@ -360,11 +396,12 @@ impl UpdateController {
         let previous = PreviousUpdateState {
             app: self.state.clone(),
             library: self.library_state.clone(),
-            no_update_visible: self.no_update_visible,
         };
         self.state = UpdateState::Checking;
         self.library_state = LibraryUpdateState::Checking;
         self.no_update_visible = false;
+        self.app_notification_dismissed = false;
+        self.library_notification_dismissed = false;
         self.cancel_hide();
         cx.notify();
 
@@ -396,6 +433,7 @@ impl UpdateController {
 
     fn spawn_app_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state = UpdateState::Checking;
+        self.app_notification_dismissed = false;
         cx.notify();
 
         let (sender, receiver) = smol::channel::unbounded();
@@ -437,6 +475,7 @@ impl UpdateController {
 
     fn spawn_library_check(&mut self, cx: &mut Context<Self>) {
         self.library_state = LibraryUpdateState::Checking;
+        self.library_notification_dismissed = false;
         cx.notify();
 
         let (sender, receiver) = smol::channel::unbounded();
@@ -524,13 +563,7 @@ impl UpdateController {
         } else if errors.is_empty() {
             self.open_available_dialog(window, cx);
         } else {
-            self.no_update_visible = previous.no_update_visible;
-            if self.no_update_visible
-                && matches!(self.state, UpdateState::UpToDate)
-                && matches!(self.library_state, LibraryUpdateState::UpToDate)
-            {
-                self.schedule_hide(cx);
-            }
+            self.hide_notifications_after_failed_check();
             self.open_error_dialog(
                 "アップデートを確認できませんでした",
                 &errors.join("\n"),
@@ -737,6 +770,7 @@ impl UpdateController {
             return;
         };
         self.cancel_hide();
+        self.app_notification_dismissed = false;
         self.state = UpdateState::Installing(InstallPhase::Downloading {
             received: 0,
             total: None,
@@ -782,6 +816,7 @@ impl UpdateController {
             return;
         }
         let entries = self.available_tools.clone();
+        self.library_notification_dismissed = false;
         self.library_state = LibraryUpdateState::Installing(LibraryInstallPhase::Downloading {
             tool: entries[0].name.clone(),
             received: 0,
@@ -922,15 +957,61 @@ impl UpdateController {
         }
     }
 
-    /// 「アップデートは有りません」表示を閉じる。
-    pub fn dismiss(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.state, UpdateState::UpToDate)
+    fn hide_notifications_after_failed_check(&mut self) {
+        self.no_update_visible = false;
+        self.app_notification_dismissed = true;
+        self.library_notification_dismissed = true;
+        self.cancel_hide();
+    }
+
+    /// 更新通知を閉じる。確認中・インストール中は、進捗を失わないよう無視する。
+    pub fn dismiss_notification(&mut self, cx: &mut Context<Self>) {
+        if self.dismiss_notification_state() {
+            cx.notify();
+        }
+    }
+
+    fn dismiss_notification_state(&mut self) -> bool {
+        if self.is_busy() {
+            return false;
+        }
+
+        let mut changed = false;
+        if matches!(self.library_state, LibraryUpdateState::Failed(_)) {
+            self.library_notification_dismissed = true;
+            changed = true;
+            // 失敗通知の下にアプリの更新通知を再表示しない。
+            if matches!(
+                self.state,
+                UpdateState::Failed(_) | UpdateState::UpToDate | UpdateState::Available(_)
+            ) {
+                self.app_notification_dismissed = true;
+            }
+        } else if matches!(self.state, UpdateState::Failed(_)) {
+            self.app_notification_dismissed = true;
+            changed = true;
+        } else if self.has_app_update() || self.has_library_update() {
+            self.app_notification_dismissed = self.has_app_update();
+            self.library_notification_dismissed = self.has_library_update();
+            changed = self.app_notification_dismissed || self.library_notification_dismissed;
+        } else if self.no_update_visible
+            && matches!(self.state, UpdateState::UpToDate)
             && matches!(self.library_state, LibraryUpdateState::UpToDate)
         {
             self.no_update_visible = false;
             self.cancel_hide();
-            cx.notify();
+            changed = true;
         }
+
+        if changed
+            && !(matches!(self.state, UpdateState::UpToDate)
+                && matches!(self.library_state, LibraryUpdateState::UpToDate))
+        {
+            self.no_update_visible = false;
+            self.cancel_hide();
+        }
+
+        changed
     }
 
     fn finish_app_install(
@@ -1056,6 +1137,123 @@ mod tests {
     }
 
     #[test]
+    fn separates_download_status_from_percentage() {
+        let phase = InstallPhase::Downloading {
+            received: 50,
+            total: Some(100),
+        };
+        assert_eq!(phase.status_label(), "ダウンロード中");
+        assert_eq!(phase.percent(), Some(50.0));
+
+        let phase = LibraryInstallPhase::Downloading {
+            tool: "yt-dlp".to_string(),
+            received: 50,
+            total: Some(100),
+            step: 1,
+            steps: 2,
+        };
+        assert_eq!(phase.status_label(), "yt-dlp をダウンロード中 (1/2)");
+        assert_eq!(phase.percent(), Some(50.0));
+    }
+
+    #[test]
+    fn dismisses_available_notifications_without_losing_update_state() {
+        let mut controller = UpdateController::new();
+        controller.library_check_completed = true;
+        controller.state = UpdateState::Available(info());
+        controller.available = Some(info());
+        controller.library_state = LibraryUpdateState::Available(vec![tool("yt-dlp")]);
+
+        assert!(controller.dismiss_notification_state());
+        assert_eq!(controller.available_update_label(), None);
+        assert!(controller.has_app_update());
+        assert!(controller.has_library_update());
+        assert!(matches!(controller.state, UpdateState::Available(_)));
+    }
+
+    #[test]
+    fn hides_only_the_dismissed_available_update() {
+        let mut controller = UpdateController::new();
+        controller.library_check_completed = true;
+        controller.state = UpdateState::Available(info());
+        controller.available = Some(info());
+        controller.library_state = LibraryUpdateState::Available(vec![tool("yt-dlp")]);
+        controller.app_notification_dismissed = true;
+
+        assert_eq!(
+            controller.available_update_label(),
+            Some("ライブラリの更新が有ります")
+        );
+        assert!(controller.has_app_update());
+    }
+
+    #[test]
+    fn dismissing_library_failure_does_not_reveal_the_app_notification() {
+        let mut controller = UpdateController::new();
+        controller.library_check_completed = true;
+        controller.state = UpdateState::Available(info());
+        controller.available = Some(info());
+        controller.library_state = LibraryUpdateState::Failed("offline".to_string());
+
+        assert!(controller.dismiss_notification_state());
+        assert!(!controller.is_app_update_notification_visible());
+        assert!(!controller.is_library_update_notification_visible());
+        assert!(controller.has_app_update());
+    }
+
+    #[test]
+    fn dismissing_failure_does_not_reveal_a_stale_no_update_notification() {
+        let mut controller = UpdateController::new();
+        controller.state = UpdateState::UpToDate;
+        controller.library_state = LibraryUpdateState::Failed("offline".to_string());
+        controller.no_update_visible = true;
+
+        assert!(controller.dismiss_notification_state());
+        assert!(!controller.no_update_visible);
+        assert!(!controller.is_app_update_notification_visible());
+        assert!(!controller.is_library_update_notification_visible());
+    }
+
+    #[test]
+    fn failed_check_hides_notifications_without_losing_update_state() {
+        let mut controller = UpdateController::new();
+        controller.library_check_completed = true;
+        controller.state = UpdateState::Available(info());
+        controller.available = Some(info());
+        controller.library_state = LibraryUpdateState::Available(vec![tool("yt-dlp")]);
+        controller.no_update_visible = true;
+
+        controller.hide_notifications_after_failed_check();
+
+        assert_eq!(controller.available_update_label(), None);
+        assert!(!controller.no_update_visible);
+        assert!(!controller.is_app_update_notification_visible());
+        assert!(!controller.is_library_update_notification_visible());
+        assert!(controller.has_app_update());
+        assert!(controller.has_library_update());
+    }
+
+    #[test]
+    fn keeps_notifications_visible_while_installing() {
+        let mut controller = UpdateController::new();
+        controller.state = UpdateState::Installing(InstallPhase::Verifying);
+
+        assert!(!controller.dismiss_notification_state());
+        assert!(controller.is_app_update_notification_visible());
+    }
+
+    #[test]
+    fn dismisses_the_no_update_notification() {
+        let mut controller = UpdateController::new();
+        controller.state = UpdateState::UpToDate;
+        controller.library_state = LibraryUpdateState::UpToDate;
+        controller.no_update_visible = true;
+
+        assert!(controller.dismiss_notification_state());
+        assert!(!controller.no_update_visible);
+    }
+
+    #[test]
     fn reports_installing_only_for_the_install_state() {
         let mut controller = UpdateController::new();
         assert!(!controller.is_installing());
@@ -1071,6 +1269,8 @@ mod tests {
             available: Some(info()),
             available_tools: Vec::new(),
             no_update_visible: false,
+            app_notification_dismissed: false,
+            library_notification_dismissed: false,
             hide_task: None,
             install_app_after_library: false,
             library_background_started: false,

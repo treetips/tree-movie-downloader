@@ -10,10 +10,12 @@ mod queue_table;
 mod quick_download;
 mod quick_url;
 mod settings_page;
+mod thumbnail;
 mod tool_bootstrap;
 mod tools;
 mod update_controller;
 mod updater;
+mod video_preview;
 mod wallpaper;
 
 use std::borrow::Cow;
