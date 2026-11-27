@@ -728,7 +728,7 @@ fn executable_name(base: &str) -> String {
     }
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -968,6 +968,20 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o755, 0o755);
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_files_without_execute_permission() {
+        let root = temp_dir("non-executable");
+        let binary = root.join("deno");
+        fs::write(&binary, b"binary").unwrap();
+
+        assert!(!is_executable_file(&binary));
+        set_executable(&binary).unwrap();
+        assert!(is_executable_file(&binary));
 
         let _ = fs::remove_dir_all(root);
     }

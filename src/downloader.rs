@@ -19,7 +19,7 @@ use crate::model::{
     compact_url,
 };
 use crate::thumbnail::load_thumbnail;
-use crate::tools::ToolPaths;
+use crate::tools::{ToolPaths, is_executable_file};
 
 /// 出力がこの時間途切れたら、yt-dlpが固まったとみなして停止する。
 ///
@@ -641,7 +641,7 @@ fn run_once(
         command.arg("--ffmpeg-location").arg(location);
     }
     if let Some(deno) = deno_location() {
-        apply_js_runtime_args(&mut command, Some(&deno));
+        apply_js_runtime_args(&mut command, &deno);
     }
     if let Some(browser) = &task.cookies_from_browser {
         command.arg("--cookies-from-browser").arg(browser);
@@ -880,7 +880,7 @@ fn fetch_video_metadata(
 ) -> Option<Vec<PrintedMetadata>> {
     let mut command = Command::new(yt_dlp);
     if let Some(deno) = deno_location() {
-        apply_js_runtime_args(&mut command, Some(&deno));
+        apply_js_runtime_args(&mut command, &deno);
     }
     if let Some(browser) = &task.cookies_from_browser {
         command.arg("--cookies-from-browser").arg(browser);
@@ -1150,12 +1150,10 @@ fn apply_container_args(
 }
 
 /// GUIアプリの PATH に依存せず、YouTubeのJS challenge解消に使うDenoを渡す。
-fn apply_js_runtime_args(command: &mut Command, deno: Option<&Path>) {
-    if let Some(deno) = deno {
-        command
-            .arg("--js-runtimes")
-            .arg(format!("deno:{}", deno.display()));
-    }
+fn apply_js_runtime_args(command: &mut Command, deno: &Path) {
+    command
+        .arg("--js-runtimes")
+        .arg(format!("deno:{}", deno.display()));
 }
 
 fn convert_template(template: &str) -> String {
@@ -1230,7 +1228,7 @@ fn ffmpeg_location() -> Option<PathBuf> {
 /// 管理下の Deno を最優先で探す。開発時は PATH や既存のインストール先も利用する。
 fn deno_location() -> Option<PathBuf> {
     let managed = ToolPaths::from_env().deno();
-    if managed.is_file() {
+    if is_executable_file(&managed) {
         return Some(managed);
     }
 
@@ -1238,7 +1236,7 @@ fn deno_location() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         for directory in std::env::split_paths(&path) {
             let candidate = directory.join(executable);
-            if candidate.is_file() {
+            if is_executable_file(&candidate) {
                 return Some(candidate);
             }
         }
@@ -1246,7 +1244,7 @@ fn deno_location() -> Option<PathBuf> {
 
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let candidate = PathBuf::from(home).join(".deno/bin").join(executable);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -1254,7 +1252,7 @@ fn deno_location() -> Option<PathBuf> {
     ["/opt/homebrew/bin", "/usr/local/bin"]
         .into_iter()
         .map(|directory| PathBuf::from(directory).join(executable))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
 }
 
 /// 再試行しても改善しないエラー。
@@ -1557,15 +1555,11 @@ mod tests {
         }
 
         let mut command = Command::new("yt-dlp");
-        apply_js_runtime_args(&mut command, Some(Path::new("/managed tools/deno")));
+        apply_js_runtime_args(&mut command, Path::new("/managed tools/deno"));
         assert_eq!(
             args(&command),
             vec!["--js-runtimes", "deno:/managed tools/deno"]
         );
-
-        let mut command = Command::new("yt-dlp");
-        apply_js_runtime_args(&mut command, None);
-        assert!(args(&command).is_empty());
     }
 
     #[test]
