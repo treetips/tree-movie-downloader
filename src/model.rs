@@ -2,10 +2,13 @@
 //!
 //! この段階では yt-dlp を呼び出さず、画面確認のための状態だけを持つ。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use chrono::Local;
 use gpui_kit::{EventEmitter, SharedString};
+
+use crate::thumbnail::Thumbnail;
 
 /// ダウンロードする画質。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,7 +350,7 @@ impl ItemStatus {
 
 /// キューの1項目。
 ///
-/// タイトルはYouTube APIなしでは取得できないため保持せず、URLを表示上の識別子とする。
+/// タイトル・サムネイルはyt-dlpの結果から取得し、URLを表示上のフォールバックとする。
 #[derive(Clone)]
 pub struct QueueItem {
     id: u64,
@@ -365,6 +368,9 @@ pub struct QueueItem {
     attempts: usize,
     error: Option<SharedString>,
     output_path: Option<SharedString>,
+    title: Option<SharedString>,
+    thumbnail_url: Option<SharedString>,
+    thumbnail: Option<Thumbnail>,
     single_item: bool,
 }
 
@@ -395,6 +401,9 @@ impl QueueItem {
             attempts: 0,
             error: None,
             output_path: None,
+            title: None,
+            thumbnail_url: None,
+            thumbnail: None,
             single_item: false,
         }
     }
@@ -488,6 +497,40 @@ impl QueueItem {
         } else {
             None
         }
+    }
+
+    pub fn title(&self) -> Option<&SharedString> {
+        if matches!(self.status, ItemStatus::Completed | ItemStatus::Skipped) {
+            self.title.as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub fn thumbnail(&self) -> Option<&Thumbnail> {
+        if matches!(self.status, ItemStatus::Completed | ItemStatus::Skipped) {
+            self.thumbnail.as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn clear_result_metadata(&mut self) {
+        self.title = None;
+        self.thumbnail_url = None;
+        self.thumbnail = None;
+    }
+
+    fn reset_for_retry(&mut self) {
+        self.status = ItemStatus::Queued;
+        self.progress = 0.0;
+        self.attempts = 0;
+        self.error = None;
+        self.eta = None;
+        self.output_path = None;
+        self.downloaded = UNKNOWN_PROGRESS.into();
+        self.total = UNKNOWN_PROGRESS.into();
+        self.clear_result_metadata();
     }
 
     pub fn is_single_item(&self) -> bool {
@@ -601,6 +644,12 @@ pub fn compact_url(url: &str) -> String {
     } else {
         stripped
     }
+}
+
+pub(crate) fn nonempty_metadata(value: Option<&str>) -> Option<&str> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "NA")
 }
 
 /// キュー、設定、ログをまとめて保持する。
@@ -798,6 +847,11 @@ impl QueueModel {
 
     pub fn item(&self, id: u64) -> Option<&QueueItem> {
         self.items.iter().find(|item| item.id == id)
+    }
+
+    pub fn has_url(&self, url: &str) -> bool {
+        let url = url.trim();
+        self.items.iter().any(|item| item.url().as_ref() == url)
     }
 
     pub fn settings(&self) -> &DownloadSettings {
@@ -1101,7 +1155,15 @@ impl QueueModel {
 
         let mut added = 0;
         let mut added_sites = Vec::new();
+        let mut registered_urls: HashSet<String> = self
+            .items
+            .iter()
+            .map(|item| item.url().to_string())
+            .collect();
         for url in urls {
+            if !registered_urls.insert(url.to_string()) {
+                continue;
+            }
             let (_, site) = self.push_url(url, quality, audio, container, destination, false);
             added_sites.push(site);
             added += 1;
@@ -1135,7 +1197,7 @@ impl QueueModel {
         destination: &str,
     ) -> Option<u64> {
         let url = url.trim();
-        if !is_http_url(url) {
+        if !is_http_url(url) || self.has_url(url) {
             return None;
         }
         let container = container.for_quality(quality);
@@ -1151,6 +1213,41 @@ impl QueueModel {
             ),
         );
         Some(id)
+    }
+
+    pub fn replace_completed_single_url(
+        &mut self,
+        id: u64,
+        url: &str,
+        quality: Quality,
+        audio: AudioQuality,
+        container: Container,
+        destination: &str,
+    ) -> Option<u64> {
+        let url = url.trim();
+        if !is_http_url(url) {
+            return None;
+        }
+        let index = self.items.iter().position(|item| {
+            item.id == id
+                && item.url.as_ref() == url
+                && matches!(item.status, ItemStatus::Completed | ItemStatus::Skipped)
+        })?;
+        self.items.remove(index);
+
+        let container = container.for_quality(quality);
+        let (new_id, site) = self.push_url(url, quality, audio, container, destination, true);
+        self.push_log_for_site(
+            site,
+            LogLevel::Info,
+            format!(
+                "1件を再ダウンロード用にキューへ追加しました（画質 {} / 音質 {} / コンテナ {}）",
+                quality.short(),
+                audio.label(),
+                container.label()
+            ),
+        );
+        Some(new_id)
     }
 
     fn push_url(
@@ -1204,6 +1301,7 @@ impl QueueModel {
         item.eta = None;
         item.downloaded = UNKNOWN_PROGRESS.into();
         item.total = UNKNOWN_PROGRESS.into();
+        item.clear_result_metadata();
         let url = compact_url(&item.url);
         let item = item.clone();
         self.push_log_for_site(
@@ -1239,6 +1337,25 @@ impl QueueModel {
         }
     }
 
+    pub fn set_item_metadata(&mut self, id: u64, title: Option<&str>, thumbnail_url: Option<&str>) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+            item.title = nonempty_metadata(title).map(Into::into);
+            item.thumbnail_url = nonempty_metadata(thumbnail_url).map(Into::into);
+            item.thumbnail = None;
+        }
+    }
+
+    pub fn set_item_thumbnail(&mut self, id: u64, url: &str, thumbnail: Thumbnail) -> bool {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        if item.thumbnail_url.as_deref() != Some(url) {
+            return false;
+        }
+        item.thumbnail = Some(thumbnail);
+        true
+    }
+
     pub fn complete_item(&mut self, id: u64, path: Option<&str>) {
         if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
             item.status = ItemStatus::Completed;
@@ -1264,6 +1381,15 @@ impl QueueModel {
     }
 
     /// yt-dlpの警告を、その項目のサイトのログへ記録する。
+    pub fn info_item(&mut self, id: u64, message: impl Into<SharedString>) {
+        let Some(item) = self.items.iter().find(|item| item.id == id) else {
+            return;
+        };
+        let site = item.site;
+        let url = compact_url(&item.url);
+        self.push_log_for_site(site, LogLevel::Info, format!("[{url}] {}", message.into()));
+    }
+
     pub fn warn_item(&mut self, id: u64, message: impl Into<SharedString>) {
         let Some(item) = self.items.iter().find(|item| item.id == id) else {
             return;
@@ -1300,13 +1426,7 @@ impl QueueModel {
             && item.status == ItemStatus::Failed
         {
             let site = item.site;
-            item.status = ItemStatus::Queued;
-            item.progress = 0.0;
-            item.attempts = 0;
-            item.error = None;
-            item.output_path = None;
-            item.downloaded = UNKNOWN_PROGRESS.into();
-            item.total = UNKNOWN_PROGRESS.into();
+            item.reset_for_retry();
             Some((site, compact_url(&item.url)))
         } else {
             None
@@ -1324,13 +1444,7 @@ impl QueueModel {
         let mut retried = 0;
         for item in &mut self.items {
             if item.status == ItemStatus::Failed {
-                item.status = ItemStatus::Queued;
-                item.progress = 0.0;
-                item.attempts = 0;
-                item.error = None;
-                item.output_path = None;
-                item.downloaded = UNKNOWN_PROGRESS.into();
-                item.total = UNKNOWN_PROGRESS.into();
+                item.reset_for_retry();
                 retried += 1;
             }
         }
@@ -1347,13 +1461,7 @@ impl QueueModel {
         let mut retried = 0;
         for item in self.items.iter_mut().filter(|item| item.site == site) {
             if item.status == ItemStatus::Failed {
-                item.status = ItemStatus::Queued;
-                item.progress = 0.0;
-                item.attempts = 0;
-                item.error = None;
-                item.output_path = None;
-                item.downloaded = UNKNOWN_PROGRESS.into();
-                item.total = UNKNOWN_PROGRESS.into();
+                item.reset_for_retry();
                 retried += 1;
             }
         }
@@ -1458,6 +1566,9 @@ impl QueueModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use gpui_kit::{Image, ImageFormat};
 
     #[test]
     fn new_queue_starts_empty() {
@@ -1506,6 +1617,119 @@ mod tests {
         let item = model.items().last().unwrap();
         assert_eq!(item.status(), ItemStatus::Completed);
         assert_eq!(item.output_path(), None);
+    }
+
+    #[test]
+    fn result_metadata_is_visible_only_after_success() {
+        let mut model = QueueModel::new();
+        model.add_urls_with(
+            "https://example.com/video",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+        let id = model.items().last().unwrap().id();
+        model.set_item_metadata(
+            id,
+            Some("動画タイトル"),
+            Some("https://example.com/thumbnail.jpg"),
+        );
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, b"thumbnail".to_vec()));
+        let thumbnail = Thumbnail::new(image.clone(), image, 1, 1);
+        assert!(model.set_item_thumbnail(id, "https://example.com/thumbnail.jpg", thumbnail));
+
+        let item = model.items().last().unwrap();
+        assert_eq!(item.title(), None);
+        assert!(item.thumbnail().is_none());
+
+        model.complete_item(id, Some("/tmp/video.mp4"));
+
+        let item = model.items().last().unwrap();
+        assert_eq!(item.title().unwrap().as_ref(), "動画タイトル");
+        assert!(item.thumbnail().is_some());
+    }
+
+    #[test]
+    fn stale_thumbnail_results_are_ignored() {
+        let mut model = QueueModel::new();
+        model.add_urls_with(
+            "https://example.com/video",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+        let id = model.items().last().unwrap().id();
+        model.set_item_metadata(
+            id,
+            Some("動画タイトル"),
+            Some("https://example.com/old.jpg"),
+        );
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, b"thumbnail".to_vec()));
+        let thumbnail = Thumbnail::new(image.clone(), image, 1, 1);
+
+        assert!(!model.set_item_thumbnail(id, "https://example.com/new.jpg", thumbnail.clone()));
+        assert!(model.items().last().unwrap().thumbnail.is_none());
+        assert!(model.set_item_thumbnail(id, "https://example.com/old.jpg", thumbnail));
+    }
+
+    #[test]
+    fn retry_clears_previous_result_metadata() {
+        let mut model = QueueModel::new();
+        model.add_urls_with(
+            "https://example.com/video",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+        let id = model.items().last().unwrap().id();
+        model.set_item_metadata(
+            id,
+            Some("動画タイトル"),
+            Some("https://example.com/thumb.jpg"),
+        );
+        model.fail_item(id, "failed");
+        model.retry(id);
+
+        let item = model.items().last().unwrap();
+        assert!(item.title.is_none());
+        assert!(item.thumbnail_url.is_none());
+        assert!(item.thumbnail.is_none());
+    }
+
+    #[test]
+    fn bulk_retries_clear_previous_result_metadata() {
+        let mut model = QueueModel::new();
+        model.add_urls_with(
+            "https://example.com/video",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+        let id = model.items().last().unwrap().id();
+        model.set_item_metadata(
+            id,
+            Some("動画タイトル"),
+            Some("https://example.com/thumb.jpg"),
+        );
+        model.fail_item(id, "failed");
+        assert_eq!(model.retry_failed_for_site(Site::Other), 1);
+        assert!(model.items().last().unwrap().title.is_none());
+        assert!(model.items().last().unwrap().thumbnail_url.is_none());
+
+        model.set_item_metadata(
+            id,
+            Some("動画タイトル"),
+            Some("https://example.com/thumb.jpg"),
+        );
+        model.fail_item(id, "failed");
+        assert_eq!(model.retry_failed(), 1);
+        assert!(model.items().last().unwrap().title.is_none());
+        assert!(model.items().last().unwrap().thumbnail_url.is_none());
+        assert!(model.items().last().unwrap().thumbnail.is_none());
     }
 
     #[test]
@@ -1571,6 +1795,120 @@ mod tests {
         assert_eq!(added_item.quality(), DEFAULT_QUALITY);
         assert_eq!(added_item.audio(), DEFAULT_AUDIO);
         assert_eq!(added_item.container(), DEFAULT_CONTAINER);
+    }
+
+    #[test]
+    fn add_urls_skips_duplicates_in_the_queue_and_the_same_input() {
+        let mut model = QueueModel::new();
+
+        let added = model.add_urls_with(
+            " https://example.com/a \nhttps://example.com/a\nhttps://example.com/b\nhttps://example.com/b\n",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+        assert_eq!(added, 2);
+        assert_eq!(model.items().len(), 2);
+        assert!(model.has_url(" https://example.com/a "));
+
+        let added = model.add_urls_with(
+            "https://example.com/a\nhttps://example.com/c\n",
+            DEFAULT_QUALITY,
+            DEFAULT_AUDIO,
+            DEFAULT_CONTAINER,
+            &default_downloads_dir(),
+        );
+        assert_eq!(added, 1);
+        assert_eq!(model.items().len(), 3);
+        assert_eq!(
+            model
+                .items()
+                .iter()
+                .map(|item| item.url().as_ref())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://example.com/a",
+                "https://example.com/b",
+                "https://example.com/c"
+            ]
+        );
+    }
+
+    #[test]
+    fn single_url_additions_reject_duplicates_until_the_item_is_removed() {
+        let mut model = QueueModel::new();
+        let id = model
+            .add_single_url(
+                "https://example.com/video",
+                DEFAULT_QUALITY,
+                DEFAULT_AUDIO,
+                DEFAULT_CONTAINER,
+                &default_downloads_dir(),
+            )
+            .expect("add one URL");
+        model.complete_item(id, Some("/tmp/video.mp4"));
+
+        assert!(
+            model
+                .add_single_url(
+                    " https://example.com/video ",
+                    DEFAULT_QUALITY,
+                    DEFAULT_AUDIO,
+                    DEFAULT_CONTAINER,
+                    &default_downloads_dir(),
+                )
+                .is_none()
+        );
+        assert_eq!(model.items().len(), 1);
+
+        model.remove(id);
+        assert!(
+            model
+                .add_single_url(
+                    "https://example.com/video",
+                    DEFAULT_QUALITY,
+                    DEFAULT_AUDIO,
+                    DEFAULT_CONTAINER,
+                    &default_downloads_dir(),
+                )
+                .is_some()
+        );
+        assert_eq!(model.items().len(), 1);
+    }
+
+    #[test]
+    fn completed_single_urls_can_be_replaced_for_redownload() {
+        let mut model = QueueModel::new();
+        let id = model
+            .add_single_url(
+                "https://example.com/video",
+                DEFAULT_QUALITY,
+                DEFAULT_AUDIO,
+                DEFAULT_CONTAINER,
+                "/tmp",
+            )
+            .expect("add URL");
+        model.complete_item(id, Some("/tmp/video.mkv"));
+
+        let new_id = model
+            .replace_completed_single_url(
+                id,
+                "https://example.com/video",
+                DEFAULT_QUALITY,
+                DEFAULT_AUDIO,
+                DEFAULT_CONTAINER,
+                "/tmp",
+            )
+            .expect("replace completed URL");
+
+        assert_ne!(new_id, id);
+        assert_eq!(model.items().len(), 1);
+        assert!(model.item(id).is_none());
+        assert_eq!(
+            model.item(new_id).expect("new item").status(),
+            ItemStatus::Queued
+        );
     }
 
     #[test]

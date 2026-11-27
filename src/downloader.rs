@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gpui_kit::{Context, Entity, SharedString};
+use gpui_kit::{AppContext as _, AsyncApp, Context, Entity, SharedString};
+use serde::Deserialize;
 
 use crate::app_settings::{AppSettings, DEFAULT_FILENAME_TEMPLATE, play_sound, scan_sounds};
 use crate::file_actions::expand_path;
@@ -17,6 +18,7 @@ use crate::model::{
     AudioQuality, Container, ItemStatus, Quality, QueueEvent, QueueItem, QueueModel, Site,
     compact_url,
 };
+use crate::thumbnail::load_thumbnail;
 use crate::tools::ToolPaths;
 
 /// 出力がこの時間途切れたら、yt-dlpが固まったとみなして停止する。
@@ -50,6 +52,7 @@ struct DownloadTask {
     cookies_from_browser: Option<String>,
     retries: usize,
     single_item: bool,
+    force: bool,
 }
 
 enum DownloadEvent {
@@ -73,6 +76,13 @@ enum DownloadEvent {
     Skipped {
         id: u64,
         path: String,
+        title: Option<String>,
+        thumbnail_url: Option<String>,
+    },
+    Metadata {
+        id: u64,
+        title: Option<String>,
+        thumbnail_url: Option<String>,
     },
     Warning {
         id: u64,
@@ -87,6 +97,24 @@ enum RunOutcome {
     Success(Option<String>),
     Failed(String),
     Cancelled,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrintedMetadata {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    thumbnail: Option<String>,
+    #[serde(default)]
+    filepath: Option<String>,
+}
+
+struct ExistingDownload {
+    path: String,
+    title: Option<String>,
+    thumbnail_url: Option<String>,
 }
 
 impl DownloadManager {
@@ -171,13 +199,22 @@ impl DownloadManager {
 
     /// 指定した項目を直接開始する。完了後に同サイトの後続項目は自動開始しない。
     pub fn start_item(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        self.start_item_with_force(id, false, cx)
+    }
+
+    /// 完了・保存済み項目を、明示的な再ダウンロードとして開始する。
+    pub fn start_forced_item(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        self.start_item_with_force(id, true, cx)
+    }
+
+    fn start_item_with_force(&mut self, id: u64, force: bool, cx: &mut Context<Self>) -> bool {
         let Some(item) = self.queue.read(cx).item(id) else {
             return false;
         };
         if !matches!(item.status(), ItemStatus::Paused | ItemStatus::Queued) {
             return false;
         }
-        self.start_task(item.site(), Some(id), false, cx)
+        self.start_task(item.site(), Some(id), false, force, cx)
     }
 
     /// 現在実行中の指定項目だけをキャンセルする。
@@ -200,7 +237,7 @@ impl DownloadManager {
     }
 
     fn start_site(&mut self, site: Site, cx: &mut Context<Self>) {
-        let _ = self.start_task(site, None, true, cx);
+        let _ = self.start_task(site, None, true, false, cx);
     }
 
     fn start_task(
@@ -208,6 +245,7 @@ impl DownloadManager {
         site: Site,
         id: Option<u64>,
         continue_site: bool,
+        force: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.active.contains_key(&site) || self.queue.read(cx).site_is_running(site) {
@@ -240,6 +278,7 @@ impl DownloadManager {
                 filename_template,
                 cookies_from_browser,
                 retries,
+                force,
             ))
         });
         let Some(task) = task else {
@@ -311,15 +350,38 @@ impl DownloadManager {
                         should_start_next = true;
                         break;
                     }
-                    DownloadEvent::Skipped { id, path } => {
+                    DownloadEvent::Skipped {
+                        id,
+                        path,
+                        title,
+                        thumbnail_url,
+                    } => {
                         queue.update(cx, |model, cx| {
+                            model.set_item_metadata(id, title.as_deref(), thumbnail_url.as_deref());
                             model.skip_already_downloaded(id, &path);
                             cx.emit(QueueEvent::Changed);
                             cx.notify();
                         });
+                        if let Some(url) = thumbnail_url.filter(|url| !url.trim().is_empty()) {
+                            spawn_thumbnail_load(queue.clone(), id, url, cx);
+                        }
                         report_terminal_feedback(feedback);
                         should_start_next = true;
                         break;
+                    }
+                    DownloadEvent::Metadata {
+                        id,
+                        title,
+                        thumbnail_url,
+                    } => {
+                        queue.update(cx, |model, cx| {
+                            model.set_item_metadata(id, title.as_deref(), thumbnail_url.as_deref());
+                            cx.emit(QueueEvent::Changed);
+                            cx.notify();
+                        });
+                        if let Some(url) = thumbnail_url.filter(|url| !url.trim().is_empty()) {
+                            spawn_thumbnail_load(queue.clone(), id, url, cx);
+                        }
                     }
                     DownloadEvent::Warning { id, message } => {
                         queue.update(cx, |model, cx| {
@@ -352,11 +414,38 @@ impl DownloadManager {
     }
 }
 
+fn spawn_thumbnail_load(queue: Entity<QueueModel>, id: u64, url: String, cx: &mut AsyncApp) {
+    let thumbnail_queue = queue.clone();
+    cx.spawn(async move |cx| {
+        let thumbnail_url = url.clone();
+        let image = cx
+            .background_spawn(async move { load_thumbnail(&thumbnail_url) })
+            .await;
+        match image {
+            Ok(image) => {
+                thumbnail_queue.update(cx, |model, cx| {
+                    if model.set_item_thumbnail(id, &url, image) {
+                        cx.emit(QueueEvent::Changed);
+                        cx.notify();
+                    }
+                });
+            }
+            Err(error) => {
+                thumbnail_queue.update(cx, |model, _| {
+                    model.info_item(id, format!("サムネイルを表示できません: {error}"));
+                });
+            }
+        }
+    })
+    .detach();
+}
+
 fn task_from_item(
     item: QueueItem,
     filename_template: String,
     cookies_from_browser: Option<String>,
     retries: usize,
+    force: bool,
 ) -> DownloadTask {
     DownloadTask {
         id: item.id(),
@@ -369,6 +458,7 @@ fn task_from_item(
         cookies_from_browser,
         retries,
         single_item: item.is_single_item(),
+        force,
     }
 }
 
@@ -415,6 +505,14 @@ fn playlist_items_arg(task: &DownloadTask) -> &'static str {
     if task.single_item { "1" } else { "1-2" }
 }
 
+fn apply_overwrite_args(command: &mut Command, task: &DownloadTask) {
+    if task.force {
+        command.arg("--force-overwrites");
+    } else {
+        command.arg("--no-overwrites");
+    }
+}
+
 fn apply_single_item_args(command: &mut Command, task: &DownloadTask) {
     if single_video_only(task) {
         command.arg("--no-playlist");
@@ -445,12 +543,19 @@ fn run_worker(
         return;
     }
 
-    if let Some(path) = already_downloaded_path(&task, &pid) {
+    if !task.force
+        && let Some(existing) = already_downloaded_path(&task, &pid, &tx)
+    {
         if cancel.load(Ordering::SeqCst) {
             let _ = tx.send_blocking(DownloadEvent::Cancelled { id: task.id });
             return;
         }
-        let _ = tx.send_blocking(DownloadEvent::Skipped { id: task.id, path });
+        let _ = tx.send_blocking(DownloadEvent::Skipped {
+            id: task.id,
+            path: existing.path,
+            title: existing.title,
+            thumbnail_url: existing.thumbnail_url,
+        });
         return;
     }
 
@@ -534,12 +639,11 @@ fn run_once(
         command.arg("--cookies-from-browser").arg(browser);
     }
     apply_single_item_args(&mut command, task);
+    apply_overwrite_args(&mut command, task);
     command
         .arg("--ignore-config")
         .arg("--newline")
         .arg("--no-color")
-        .arg("--no-overwrites")
-        .arg("--no-quiet")
         .arg("--socket-timeout")
         .arg("20")
         .arg("--output-na-placeholder")
@@ -549,7 +653,8 @@ fn run_once(
         .arg("--progress-template")
         .arg("download:TMD_PROGRESS|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.eta)s")
         .arg("--print")
-        .arg("after_move:TMD_PATH:%(filepath)s");
+        .arg("after_move:TMD_METADATA:%(.{title,thumbnail,filepath})j")
+        .arg("--no-quiet");
 
     apply_container_args(&mut command, task.quality, task.audio, task.container);
 
@@ -630,14 +735,25 @@ fn run_once(
         let task_id = task.id;
         thread::spawn(move || {
             let mut paths = Vec::new();
+            let mut metadata_sent = false;
             let mut last_percent = -1.0_f32;
             let mut last_update = Instant::now();
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 stdout_activity.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                 let line = line.trim();
-                if let Some(path) = line.strip_prefix("TMD_PATH:") {
-                    if !path.is_empty() {
-                        paths.push(path.to_string());
+                if let Some(mut metadata) = parse_metadata_line(line) {
+                    if let Some(path) = output_path_value(metadata.filepath.take()) {
+                        paths.push(path);
+                    }
+                    let title = metadata_value(metadata.title.as_deref());
+                    let thumbnail_url = metadata_value(metadata.thumbnail.as_deref());
+                    if !metadata_sent && (title.is_some() || thumbnail_url.is_some()) {
+                        metadata_sent = true;
+                        let _ = stdout_tx.send_blocking(DownloadEvent::Metadata {
+                            id: task_id,
+                            title,
+                            thumbnail_url,
+                        });
                     }
                     continue;
                 }
@@ -716,29 +832,44 @@ fn run_once(
     }
 }
 
-/// 保存先に同じ動画IDのファイルがある場合、そのパスを返す。
+/// 保存先に同じ動画IDのファイルがある場合、そのパスと表示用メタデータを返す。
 ///
 /// IDはyt-dlpのメタデータ取得で確認する。プレイリストやチャンネルのように
 /// 複数件へ展開されるURLは対象外とし、通常どおりダウンロードする。
-fn already_downloaded_path(task: &DownloadTask, pid: &AtomicU32) -> Option<String> {
+fn already_downloaded_path(
+    task: &DownloadTask,
+    pid: &AtomicU32,
+    tx: &smol::channel::Sender<DownloadEvent>,
+) -> Option<ExistingDownload> {
     let destination = expand_path(&task.destination);
     if !destination.is_dir() {
         return None;
     }
 
     let yt_dlp = find_yt_dlp()?;
-    let ids = fetch_video_ids(task, &yt_dlp, pid)?;
-    let [id] = ids.as_slice() else {
+    let entries = fetch_video_metadata(task, &yt_dlp, pid, tx)?;
+    let [entry] = entries.as_slice() else {
         return None;
     };
+    let id = metadata_value(entry.id.as_deref())?;
+    let path = find_file_with_id(&destination, &id)?;
 
-    find_file_with_id(&destination, id).map(|path| path.display().to_string())
+    Some(ExistingDownload {
+        path: path.display().to_string(),
+        title: metadata_value(entry.title.as_deref()),
+        thumbnail_url: metadata_value(entry.thumbnail.as_deref()),
+    })
 }
 
-/// ダウンロード対象の動画IDを、プレイリスト展開を抑えて最大2件取得する。
+/// ダウンロード対象のメタデータを、プレイリスト展開を抑えて最大2件取得する。
 ///
 /// 2件以上返った場合は複数件のURLとみなし、ダウンロード済み判定には使わない。
-fn fetch_video_ids(task: &DownloadTask, yt_dlp: &Path, pid: &AtomicU32) -> Option<Vec<String>> {
+fn fetch_video_metadata(
+    task: &DownloadTask,
+    yt_dlp: &Path,
+    pid: &AtomicU32,
+    tx: &smol::channel::Sender<DownloadEvent>,
+) -> Option<Vec<PrintedMetadata>> {
     let mut command = Command::new(yt_dlp);
     if let Some(browser) = &task.cookies_from_browser {
         command.arg("--cookies-from-browser").arg(browser);
@@ -758,8 +889,10 @@ fn fetch_video_ids(task: &DownloadTask, yt_dlp: &Path, pid: &AtomicU32) -> Optio
         .arg(playlist_items_arg(task))
         .arg("--socket-timeout")
         .arg("20")
+        .arg("--output-na-placeholder")
+        .arg("")
         .arg("--print")
-        .arg("video:%(id)s")
+        .arg("video:%(.{id,title,thumbnail})j")
         .arg(task.url.as_ref())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -776,16 +909,38 @@ fn fetch_video_ids(task: &DownloadTask, yt_dlp: &Path, pid: &AtomicU32) -> Optio
         return None;
     }
 
-    Some(parse_ids(&String::from_utf8_lossy(&output.stdout)))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_probe_metadata(&stdout) {
+        Ok(entries) => Some(entries),
+        Err(error) => {
+            let _ = tx.send_blocking(DownloadEvent::Warning {
+                id: task.id,
+                message: format!("yt-dlpのメタデータを解析できませんでした: {error}"),
+            });
+            None
+        }
+    }
 }
 
-fn parse_ids(stdout: &str) -> Vec<String> {
+fn parse_probe_metadata(stdout: &str) -> Result<Vec<PrintedMetadata>, String> {
     stdout
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && *line != "NA")
-        .map(str::to_string)
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).map_err(|error| error.to_string()))
         .collect()
+}
+
+fn parse_metadata_line(line: &str) -> Option<PrintedMetadata> {
+    serde_json::from_str(line.strip_prefix("TMD_METADATA:")?).ok()
+}
+
+fn metadata_value(value: Option<&str>) -> Option<String> {
+    crate::model::nonempty_metadata(value).map(str::to_string)
+}
+
+fn output_path_value(value: Option<String>) -> Option<String> {
+    value.filter(|path| !path.is_empty() && path != "NA")
 }
 
 fn find_file_with_id(directory: &Path, id: &str) -> Option<PathBuf> {
@@ -1101,6 +1256,7 @@ fn terminal_feedback(event: &DownloadEvent) -> Option<TerminalFeedback> {
             notification: None,
         }),
         DownloadEvent::Progress { .. }
+        | DownloadEvent::Metadata { .. }
         | DownloadEvent::Warning { .. }
         | DownloadEvent::Cancelled { .. } => None,
     }
@@ -1175,6 +1331,7 @@ mod tests {
             cookies_from_browser: None,
             retries: 1,
             single_item: false,
+            force: false,
         }
     }
 
@@ -1183,6 +1340,8 @@ mod tests {
         let feedback = terminal_feedback(&DownloadEvent::Skipped {
             id: 1,
             path: "/tmp/video.mp4".into(),
+            title: None,
+            thumbnail_url: None,
         })
         .expect("skipped items are terminal");
 
@@ -1231,6 +1390,11 @@ mod tests {
                 id: 1,
                 message: "warning".into(),
             },
+            DownloadEvent::Metadata {
+                id: 1,
+                title: Some("title".into()),
+                thumbnail_url: None,
+            },
             DownloadEvent::Cancelled { id: 1 },
         ];
 
@@ -1261,6 +1425,26 @@ mod tests {
         task.quality = Quality::P720;
         task.audio = AudioQuality::Mute;
         assert_eq!(format_spec(&task), "bv*[height<=720]/b");
+    }
+
+    #[test]
+    fn forced_redownloads_overwrite_existing_files() {
+        fn args(command: &Command) -> Vec<String> {
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        }
+
+        let mut task = task();
+        let mut command = Command::new("yt-dlp");
+        apply_overwrite_args(&mut command, &task);
+        assert_eq!(args(&command), vec!["--no-overwrites"]);
+
+        task.force = true;
+        let mut command = Command::new("yt-dlp");
+        apply_overwrite_args(&mut command, &task);
+        assert_eq!(args(&command), vec!["--force-overwrites"]);
     }
 
     #[test]
@@ -1401,10 +1585,65 @@ mod tests {
 
     #[test]
     fn parses_video_ids_from_print_output() {
-        assert_eq!(
-            parse_ids("abc123\n\n def456 \nNA\n"),
-            vec!["abc123".to_string(), "def456".to_string()]
+        let metadata =
+            parse_probe_metadata("{\"id\":\"abc123\"}\n\n{\"id\":\" def456 \"}\n{\"id\":\"NA\"}\n")
+                .expect("parse metadata");
+        let ids: Vec<_> = metadata
+            .iter()
+            .filter_map(|entry| metadata_value(entry.id.as_deref()))
+            .collect();
+        assert_eq!(ids, vec!["abc123", "def456"]);
+    }
+
+    #[test]
+    fn parses_video_metadata_from_json_print_output() {
+        let stdout = concat!(
+            "{\"id\":\"abc123\",\"title\":\"日本語 \\\"タイトル\\\"\",\"thumbnail\":\"https://example.com/thumb.jpg\"}\n",
+            "{\"id\":\"def456\",\"title\":\"\",\"thumbnail\":\"NA\"}\n",
         );
+        let metadata = parse_probe_metadata(stdout).expect("parse metadata");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0].id.as_deref(), Some("abc123"));
+        assert_eq!(metadata[0].title.as_deref(), Some("日本語 \"タイトル\""));
+        assert_eq!(
+            metadata[0].thumbnail.as_deref(),
+            Some("https://example.com/thumb.jpg")
+        );
+        assert!(parse_probe_metadata("{\"id\":\"abc123\"}\nnot-json").is_err());
+    }
+
+    #[test]
+    fn parses_after_move_metadata_without_losing_escaped_text() {
+        let metadata = parse_metadata_line(
+            "TMD_METADATA:{\"title\":\"1行目\\n2行目\",\"thumbnail\":\"https://example.com/thumb.jpg\",\"filepath\":\"/tmp/video.mp4\"}",
+        )
+        .expect("parse metadata line");
+
+        assert_eq!(metadata.title.as_deref(), Some("1行目\n2行目"));
+        assert_eq!(
+            metadata.thumbnail.as_deref(),
+            Some("https://example.com/thumb.jpg")
+        );
+        assert_eq!(metadata.filepath.as_deref(), Some("/tmp/video.mp4"));
+        assert!(parse_metadata_line("TMD_METADATA:not-json").is_none());
+        assert!(parse_metadata_line("[download] Destination: /tmp/video.mp4").is_none());
+    }
+
+    #[test]
+    fn ignores_empty_metadata_values() {
+        assert_eq!(metadata_value(Some("  ")), None);
+        assert_eq!(metadata_value(Some("NA")), None);
+        assert_eq!(
+            metadata_value(Some(" タイトル ")).as_deref(),
+            Some("タイトル")
+        );
+        assert_eq!(
+            output_path_value(Some(" /tmp/video.mkv ".into())).as_deref(),
+            Some(" /tmp/video.mkv ")
+        );
+        assert_eq!(output_path_value(Some("  ".into())).as_deref(), Some("  "));
+        assert_eq!(output_path_value(Some(String::new())), None);
+        assert_eq!(output_path_value(Some("NA".into())), None);
     }
 
     #[test]
