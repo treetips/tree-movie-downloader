@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sys_locale::get_locale;
 
 pub const APP_DIR_NAME: &str = "tree-movie-downloader";
+pub const APP_NAME: &str = "TreeMovieDownloader";
 
 /// ダウンロードファイル名の初期テンプレート。
 pub const DEFAULT_FILENAME_TEMPLATE: &str = "${uploadDate}_${title} [${duration}][${width}x${height} ${vcodec} ${fps} ${acodec} ${abr}][${id}].${ext}";
@@ -659,5 +660,34 @@ mod tests {
     #[test]
     fn exposes_a_non_empty_app_version() {
         assert!(!APP_VERSION.is_empty());
+    }
+
+    #[test]
+    fn app_name_matches_release_workflow() {
+        let workflow_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
+        let Ok(workflow) = std::fs::read_to_string(&workflow_path) else {
+            eprintln!(
+                "リリースワークフローが見つからないため確認をスキップします: {}",
+                workflow_path.display()
+            );
+            return;
+        };
+        let declared = workflow
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("APP_NAME:"))
+            .map(|value| {
+                value
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches(|character| character == '\'' || character == '"')
+            });
+        assert_eq!(
+            declared,
+            Some(APP_NAME),
+            "リリースワークフローの APP_NAME が Rust 定数と一致しません"
+        );
     }
 }

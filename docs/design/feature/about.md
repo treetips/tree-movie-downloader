@@ -14,7 +14,7 @@
 
 #### 静的ラベル
 
-- 固定で `Tree Movie Downloader` と表示。
+- 固定で `TreeMovieDownloader` と表示。
 
 ### ✏️ バージョン番号
 

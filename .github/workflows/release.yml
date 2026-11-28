@@ -23,7 +23,7 @@ concurrency:
 env:
   REPO_URL: https://github.com/treetips/tree-movie-downloader
   MACOSX_DEPLOYMENT_TARGET: '13.0'
-  APP_NAME: 'Tree Movie Downloader'
+  APP_NAME: 'TreeMovieDownloader'
   BIN_NAME: tree-movie-downloader
   BUNDLE_ID: com.treetips.tree-movie-downloader
   RUSTC_WRAPPER: sccache
@@ -327,5 +327,5 @@ jobs:
             "${{ steps.package.outputs.update_info_path }}" \
             "dist-release/LICENSE" \
             "dist-release/THIRD_PARTY_NOTICES.md" \
-            --title "Tree Movie Downloader v${VERSION}" \
+            --title "${APP_NAME} v${VERSION}" \
             --generate-notes
