@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::app_settings::APP_VERSION;
+use crate::app_settings::{APP_NAME, APP_VERSION};
 
 /// 最新リリースの更新情報。
 pub const UPDATE_INFO_URL: &str =
@@ -22,6 +22,9 @@ pub const UPDATE_INFO_URL: &str =
 
 const UPDATE_INFO_URL_ENV: &str = "TMD_UPDATE_INFO_URL";
 const MAX_DOWNLOAD_RETRIES: u32 = 3;
+const APP_BACKUP_PREFIX: &str = ".tree-movie-downloader-backup-";
+const LEGACY_APP_BACKUP_PREFIX: &str = "Tree Movie Downloader.app.backup-";
+const APP_BACKUP_MIN_AGE_NANOS: u128 = 60_000_000_000;
 
 /// `update-info.json` の内容。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -223,9 +226,16 @@ fn install_in_work_dir(
     match running_app {
         Some(target) => {
             let _ = events.send_blocking(InstallEvent::Placing);
-            replace_app(target, &new_app)?;
-            launch_app(target)?;
-            Ok(InstallOutcome::Installed(target.clone()))
+            let placement = place_app(target, &new_app)?;
+            if let Err(error) = launch_app(&placement.destination) {
+                return Err(match restore_placement(&placement) {
+                    Ok(()) => format!("{error}（旧アプリを復元しました）"),
+                    Err(restore_error) => {
+                        format!("{error}（旧アプリの復元に失敗しました: {restore_error}）")
+                    }
+                });
+            }
+            Ok(InstallOutcome::Installed(placement.destination))
         }
         None => Ok(InstallOutcome::Revealed(new_app)),
     }
@@ -384,27 +394,188 @@ fn verify_app(app: &Path) -> Result<(), String> {
     .map_err(|error| format!("新しいアプリの署名を検証できません: {error}"))
 }
 
-fn replace_app(target: &Path, new_app: &Path) -> Result<(), String> {
-    let backup = target.with_file_name(format!(
-        "{}.backup-{}",
-        target
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "app".to_string()),
-        unix_nanos()
-    ));
+fn updated_app_path(target: &Path) -> PathBuf {
+    target.with_file_name(format!("{APP_NAME}.app"))
+}
 
+#[cfg(unix)]
+fn same_app_bundle(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if left == right {
+        return true;
+    }
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_app_bundle(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn backup_path(app: &Path) -> PathBuf {
+    let name = app
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "app".to_string());
+    app.with_file_name(format!("{APP_BACKUP_PREFIX}{name}.backup-{}", unix_nanos()))
+}
+
+fn is_stale_app_backup(name: &str, now: u128) -> bool {
+    let Some(timestamp) = name
+        .rsplit_once(".backup-")
+        .and_then(|(_, value)| value.parse::<u128>().ok())
+    else {
+        return false;
+    };
+    now.saturating_sub(timestamp) >= APP_BACKUP_MIN_AGE_NANOS
+}
+
+fn cleanup_app_backups_in(parent: &Path, now: u128) {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "アプリバックアップを確認できません（{}）: {error}",
+                parent.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with(APP_BACKUP_PREFIX) || name.starts_with(LEGACY_APP_BACKUP_PREFIX))
+            && is_stale_app_backup(&name, now)
+            && let Err(error) = fs::remove_dir_all(&path)
+        {
+            eprintln!(
+                "古いアプリバックアップを削除できません（{}）: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+struct AppPlacement {
+    target: PathBuf,
+    destination: PathBuf,
+    target_backup: Option<PathBuf>,
+    destination_backup: Option<PathBuf>,
+}
+
+fn place_app(target: &Path, new_app: &Path) -> Result<AppPlacement, String> {
+    let destination = updated_app_path(target);
+    if same_app_bundle(&destination, target) {
+        let target_backup = replace_app(target, new_app)?;
+        return Ok(AppPlacement {
+            target: target.to_path_buf(),
+            destination,
+            target_backup: Some(target_backup),
+            destination_backup: None,
+        });
+    }
+
+    let destination_backup = if destination.exists() {
+        Some(replace_app(&destination, new_app)?)
+    } else {
+        fs::rename(new_app, &destination)
+            .map_err(|error| format!("新しいアプリを配置できません: {error}"))?;
+        None
+    };
+
+    match archive_app_bundle(target) {
+        Ok(target_backup) => Ok(AppPlacement {
+            target: target.to_path_buf(),
+            destination,
+            target_backup: Some(target_backup),
+            destination_backup,
+        }),
+        Err(error) => {
+            if let Err(restore_error) =
+                restore_destination(&destination, destination_backup.as_deref())
+            {
+                return Err(format!(
+                    "{error}（新しいアプリの配置も復元できませんでした: {restore_error}）"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn restore_destination(destination: &Path, backup: Option<&Path>) -> Result<(), String> {
+    if destination.exists() {
+        fs::remove_dir_all(destination)
+            .map_err(|error| format!("新しいアプリを削除できません: {error}"))?;
+    }
+    if let Some(backup) = backup {
+        fs::rename(backup, destination)
+            .map_err(|error| format!("配置先の旧アプリを復元できません: {error}"))?;
+    }
+    Ok(())
+}
+
+fn restore_placement(placement: &AppPlacement) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(error) = restore_destination(
+        &placement.destination,
+        placement.destination_backup.as_deref(),
+    ) {
+        errors.push(format!("配置先の復元: {error}"));
+    }
+    if let Some(backup) = &placement.target_backup {
+        if placement.target.exists()
+            && let Err(error) = fs::remove_dir_all(&placement.target)
+        {
+            errors.push(format!("旧アプリの削除: {error}"));
+        }
+        if !placement.target.exists()
+            && let Err(error) = fs::rename(backup, &placement.target)
+        {
+            errors.push(format!(
+                "旧アプリの復元: {error}（バックアップ: {}）",
+                backup.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" / "))
+    }
+}
+
+fn archive_app_bundle(target: &Path) -> Result<PathBuf, String> {
+    let backup = backup_path(target);
     fs::rename(target, &backup).map_err(|error| {
         format!("現在のアプリを退避できません（管理者権限が必要な場合があります）: {error}")
     })?;
+    Ok(backup)
+}
 
+fn replace_app(target: &Path, new_app: &Path) -> Result<PathBuf, String> {
+    let backup = archive_app_bundle(target)?;
     if let Err(error) = fs::rename(new_app, target) {
-        let _ = fs::rename(&backup, target);
+        if let Err(restore_error) = fs::rename(&backup, target) {
+            return Err(format!(
+                "新しいアプリを配置できません: {error}（旧アプリの復元にも失敗しました。バックアップ: {}: {restore_error}）",
+                backup.display()
+            ));
+        }
         return Err(format!("新しいアプリを配置できません: {error}"));
     }
-
-    let _ = fs::remove_dir_all(&backup);
-    Ok(())
+    Ok(backup)
 }
 
 fn launch_app(app: &Path) -> Result<(), String> {
@@ -427,6 +598,17 @@ fn launch_app(app: &Path) -> Result<(), String> {
 pub fn running_app_bundle() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     app_bundle_for(&executable)
+}
+
+/// 移行時に残した旧バンドルを、実行中プロセスが利用しなくなった後に削除する。
+pub fn cleanup_app_backups() {
+    let Some(app) = running_app_bundle() else {
+        return;
+    };
+    let Some(parent) = app.parent() else {
+        return;
+    };
+    cleanup_app_backups_in(parent, unix_nanos());
 }
 
 fn app_bundle_for(executable: &Path) -> Option<PathBuf> {
@@ -517,7 +699,7 @@ mod tests {
             std::process::id(),
             unix_nanos()
         ));
-        let app = root.join("Tree Movie Downloader.app");
+        let app = root.join(format!("{APP_NAME}.app"));
         let macos = app.join("Contents").join("MacOS");
         fs::create_dir_all(&macos).unwrap();
         assert_eq!(
@@ -525,6 +707,81 @@ mod tests {
             Some(app)
         );
         assert!(app_bundle_for(Path::new("/tmp/tree-movie-downloader")).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identifies_the_same_bundle_across_case_variants() {
+        let root = std::env::temp_dir().join(format!(
+            "tmd-update-case-test-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let upper = root.join("Case.app");
+        let lower = root.join("case.app");
+        fs::create_dir_all(&upper).unwrap();
+
+        assert!(same_app_bundle(&upper, &upper));
+        assert!(!same_app_bundle(&upper, &root.join("Other.app")));
+        if lower.exists() {
+            assert!(same_app_bundle(&upper, &lower));
+        } else {
+            assert!(!same_app_bundle(&upper, &lower));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recognizes_generated_backups_as_stale() {
+        let now = unix_nanos();
+        let backup = backup_path(Path::new("/tmp/Custom.app"));
+        let name = backup.file_name().unwrap().to_string_lossy();
+
+        assert!(!is_stale_app_backup(&name, now));
+        let later = unix_nanos() + APP_BACKUP_MIN_AGE_NANOS;
+        assert!(is_stale_app_backup(&name, later));
+    }
+
+    #[test]
+    fn cleans_only_stale_app_backups() {
+        let root = std::env::temp_dir().join(format!(
+            "tmd-update-cleanup-test-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let now = APP_BACKUP_MIN_AGE_NANOS * 2;
+        let stale_timestamp = now - APP_BACKUP_MIN_AGE_NANOS;
+        let stale_legacy = root.join(format!(
+            "{APP_BACKUP_PREFIX}Tree Movie Downloader.app.backup-{stale_timestamp}"
+        ));
+        let legacy_prefixless = root.join(format!("{LEGACY_APP_BACKUP_PREFIX}{stale_timestamp}"));
+        let stale_current = root.join(format!(
+            "{APP_BACKUP_PREFIX}{APP_NAME}.app.backup-{stale_timestamp}"
+        ));
+        let stale_renamed = root.join(format!(
+            "{APP_BACKUP_PREFIX}TreeMovieDownloader-1.2.app.backup-{stale_timestamp}"
+        ));
+        let fresh = root.join(format!("{APP_BACKUP_PREFIX}{APP_NAME}.app.backup-{now}"));
+        let unrelated = root.join(format!("Other.app.backup-{stale_timestamp}"));
+        for path in [
+            &stale_legacy,
+            &legacy_prefixless,
+            &stale_current,
+            &stale_renamed,
+            &fresh,
+            &unrelated,
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+
+        cleanup_app_backups_in(&root, now);
+
+        assert!(!stale_legacy.exists());
+        assert!(!legacy_prefixless.exists());
+        assert!(!stale_current.exists());
+        assert!(!stale_renamed.exists());
+        assert!(fresh.exists());
+        assert!(unrelated.exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -598,11 +855,160 @@ mod tests {
         fs::write(target.join("old.txt"), b"old").unwrap();
         fs::write(new_app.join("new.txt"), b"new").unwrap();
 
-        replace_app(&target, &new_app).unwrap();
+        let backup = replace_app(&target, &new_app).unwrap();
 
         assert!(target.join("new.txt").is_file());
         assert!(!target.join("old.txt").exists());
+        assert!(backup.join("old.txt").is_file());
         assert!(!new_app.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrates_to_the_bundle_name_in_the_update() {
+        let root = std::env::temp_dir().join(format!(
+            "tmd-update-migrate-test-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let old_app = root.join("Tree Movie Downloader.app");
+        let destination = root.join(format!("{APP_NAME}.app"));
+        let new_app = root.join("extracted").join(format!("{APP_NAME}.app"));
+        fs::create_dir_all(&old_app).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&new_app).unwrap();
+        fs::write(old_app.join("old.txt"), b"old").unwrap();
+        fs::write(destination.join("previous.txt"), b"previous").unwrap();
+        fs::write(new_app.join("new.txt"), b"new").unwrap();
+
+        let placement = place_app(&old_app, &new_app).unwrap();
+
+        assert_eq!(placement.destination, destination);
+        assert!(!old_app.exists());
+        assert!(!new_app.exists());
+        assert!(placement.destination.join("new.txt").is_file());
+        assert!(!placement.destination.join("previous.txt").exists());
+        let target_backup = placement.target_backup.as_ref().unwrap();
+        let destination_backup = placement.destination_backup.as_ref().unwrap();
+        assert!(target_backup.join("old.txt").is_file());
+        assert!(destination_backup.join("previous.txt").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrates_when_the_destination_bundle_does_not_exist() {
+        let root = std::env::temp_dir().join(format!(
+            "tmd-update-first-migrate-test-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let old_app = root.join("Tree Movie Downloader.app");
+        let destination = root.join(format!("{APP_NAME}.app"));
+        let new_app = root.join("extracted").join(format!("{APP_NAME}.app"));
+        fs::create_dir_all(&old_app).unwrap();
+        fs::create_dir_all(&new_app).unwrap();
+        fs::write(old_app.join("old.txt"), b"old").unwrap();
+        fs::write(new_app.join("new.txt"), b"new").unwrap();
+        assert!(!destination.exists());
+
+        let placement = place_app(&old_app, &new_app).unwrap();
+
+        assert_eq!(placement.destination, destination);
+        assert!(!old_app.exists());
+        assert!(!new_app.exists());
+        assert!(placement.destination.join("new.txt").is_file());
+        assert!(
+            placement
+                .target_backup
+                .as_ref()
+                .unwrap()
+                .join("old.txt")
+                .is_file()
+        );
+        assert!(placement.destination_backup.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restores_the_previous_bundle_when_a_same_name_update_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "tmd-update-same-name-restore-test-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let target = root.join(format!("{APP_NAME}.app"));
+        let new_app = root.join("extracted").join(format!("{APP_NAME}.app"));
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&new_app).unwrap();
+        fs::write(target.join("old.txt"), b"old").unwrap();
+        fs::write(new_app.join("new.txt"), b"new").unwrap();
+
+        let placement = place_app(&target, &new_app).unwrap();
+        assert!(target.join("new.txt").is_file());
+        assert!(
+            placement
+                .target_backup
+                .as_ref()
+                .unwrap()
+                .join("old.txt")
+                .is_file()
+        );
+
+        restore_placement(&placement).unwrap();
+
+        assert!(target.join("old.txt").is_file());
+        assert!(!target.join("new.txt").exists());
+        assert!(!placement.target_backup.as_ref().unwrap().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restores_both_bundles_when_a_migration_update_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "tmd-update-migrate-restore-test-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let old_app = root.join("Tree Movie Downloader.app");
+        let destination = root.join(format!("{APP_NAME}.app"));
+        let new_app = root.join("extracted").join(format!("{APP_NAME}.app"));
+        fs::create_dir_all(&old_app).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&new_app).unwrap();
+        fs::write(old_app.join("old.txt"), b"old").unwrap();
+        fs::write(destination.join("previous.txt"), b"previous").unwrap();
+        fs::write(new_app.join("new.txt"), b"new").unwrap();
+
+        let placement = place_app(&old_app, &new_app).unwrap();
+        restore_placement(&placement).unwrap();
+
+        assert!(old_app.join("old.txt").is_file());
+        assert!(destination.join("previous.txt").is_file());
+        assert!(!destination.join("new.txt").exists());
+        assert!(!placement.target_backup.as_ref().unwrap().exists());
+        assert!(!placement.destination_backup.as_ref().unwrap().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keeps_the_old_bundle_when_placement_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "tmd-update-migrate-failure-test-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let old_app = root.join("Tree Movie Downloader.app");
+        let destination = root.join(format!("{APP_NAME}.app"));
+        fs::create_dir_all(&old_app).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(old_app.join("old.txt"), b"old").unwrap();
+        fs::write(destination.join("previous.txt"), b"previous").unwrap();
+
+        let result = place_app(&old_app, &root.join("missing.app"));
+
+        assert!(result.is_err());
+        assert!(old_app.join("old.txt").is_file());
+        assert!(destination.join("previous.txt").is_file());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -666,7 +1072,7 @@ mod tests {
             std::process::id(),
             unix_nanos()
         ));
-        let app = root.join("Tree Movie Downloader.app");
+        let app = root.join(format!("{APP_NAME}.app"));
         fs::create_dir_all(&app).unwrap();
         assert_eq!(find_app_bundle(&root), Some(app));
         let _ = fs::remove_dir_all(root);

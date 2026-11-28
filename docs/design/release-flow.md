@@ -29,7 +29,7 @@
    - 取得できない場合や Deno が欠けている場合はリリースを停止する。先に **Release Tools** を実行する。
 5. `cargo test --locked` と `cargo build --release --locked` を実行する。
    - 表示バージョンは `TMD_APP_VERSION` としてビルド時に注入する。
-6. `.app` を組み立てる。
+6. `TreeMovieDownloader.app` を組み立てる。
    - `Contents/MacOS/tree-movie-downloader`
    - `Contents/Info.plist`
    - `Contents/Resources/AppIcon.icns`
@@ -40,7 +40,7 @@
 8. `update-info.json` を生成し、ZIP・チェックサム・ライセンスと一緒に添付する。
 9. Gitタグ（`vX.Y.Z`）を作成・pushし、GitHub Releaseを作成する。
 
-アプリは `.app` として起動した場合、同梱アセットを `Contents/Resources/assets` から読む。`cargo run` で起動した場合はリポジトリ直下の `assets` を読む。
+アプリは `.app` として起動した場合、同梱アセットを `Contents/Resources/assets` から読む。`cargo run` で起動した場合はリポジトリ直下の `assets` を読む。アプリ更新では配置先のバンドル名を `TreeMovieDownloader.app` に変更するため、旧バンドル名のアプリも移行する。新しいアプリを配置後に旧バンドルを退避して起動し、起動失敗時は旧バンドルを復元する。退避した旧バンドルは次回以降の起動時に60秒以上経過したものだけ削除する。設定ディレクトリとバンドル識別子は変更しないため、既存設定は引き継ぐ。
 
 ### アプリ本体の配布物
 

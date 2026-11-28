@@ -1,4 +1,4 @@
-//! Tree Movie Downloader — yt-dlp を GUI で扱うデスクトップアプリ。
+//! TreeMovieDownloader — yt-dlp を GUI で扱うデスクトップアプリ。
 
 mod activity_log;
 mod app;
@@ -23,6 +23,7 @@ use std::borrow::Cow;
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
+use crate::app_settings::APP_NAME;
 use app::{AddUrls, AppView, CheckForUpdates, QuitApp, RetryFailed, StartOrPause};
 
 const ICON_PNG: &[u8] = include_bytes!("../assets/images/icon-tree-01.png");
@@ -105,6 +106,7 @@ fn set_dock_icon() {
 fn set_dock_icon() {}
 
 fn main() {
+    std::thread::spawn(updater::cleanup_app_backups);
     gpui_kit::application().with_assets(AppAssets).run(|cx| {
         gpui_kit::init(cx);
         if cfg!(debug_assertions) {
@@ -131,7 +133,7 @@ fn main() {
             KeyBinding::new("cmd-q", QuitApp, None),
         ]);
 
-        cx.set_menus([Menu::new("Tree Movie Downloader").items([
+        cx.set_menus([Menu::new(APP_NAME).items([
             MenuItem::action("アップデートを確認", CheckForUpdates),
             MenuItem::separator(),
             MenuItem::action("終了", QuitApp),

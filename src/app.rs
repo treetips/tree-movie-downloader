@@ -26,7 +26,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app_settings::{APP_VERSION, WallpaperSource};
+use crate::app_settings::{APP_NAME, APP_VERSION, WallpaperSource};
 use crate::downloader::DownloadManager;
 use crate::model::{
     AudioQuality, Container, DEFAULT_AUDIO, DEFAULT_AUDIO_CONTAINER, DEFAULT_CONTAINER,
@@ -866,12 +866,7 @@ impl AppView {
                                         .h(px(80.))
                                         .object_fit(ObjectFit::Contain),
                                 )
-                                .child(
-                                    div()
-                                        .text_xl()
-                                        .font_semibold()
-                                        .child("Tree Movie Downloader"),
-                                )
+                                .child(div().text_xl().font_semibold().child(APP_NAME))
                                 .child(
                                     div()
                                         .text_xs()
@@ -1061,12 +1056,7 @@ impl AppView {
                         .small()
                         .text_color(cx.theme().primary),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .child("Tree Movie Downloader"),
-                )
+                .child(div().text_sm().font_semibold().child(APP_NAME))
                 .child(div().flex_1())
                 .child(
                     div()

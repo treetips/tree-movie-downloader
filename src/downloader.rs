@@ -12,7 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui_kit::{AppContext as _, AsyncApp, Context, Entity, SharedString};
 use serde::Deserialize;
 
-use crate::app_settings::{AppSettings, DEFAULT_FILENAME_TEMPLATE, play_sound, scan_sounds};
+use crate::app_settings::{
+    APP_NAME, AppSettings, DEFAULT_FILENAME_TEMPLATE, play_sound, scan_sounds,
+};
 use crate::file_actions::expand_path;
 use crate::model::{
     AudioQuality, Container, ItemStatus, Quality, QueueEvent, QueueItem, QueueModel, Site,
@@ -1327,7 +1329,7 @@ fn report_terminal_feedback(feedback: Option<TerminalFeedback>) {
         && let Some(message) = feedback.notification
     {
         let script = format!(
-            "display notification \"{}\" with title \"Tree Movie Downloader\"",
+            "display notification \"{}\" with title \"{APP_NAME}\"",
             escape_applescript(&message)
         );
         let _ = Command::new("osascript").arg("-e").arg(script).spawn();
