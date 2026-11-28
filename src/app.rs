@@ -17,7 +17,7 @@ use gpui_kit::component::{
     link::Link,
     notification::Notification,
     progress::{Progress, ProgressCircle},
-    select::{Select, SelectEvent, SelectState},
+    select::{SearchableVec, Select, SelectEvent, SelectState},
     separator::Separator,
     spinner::Spinner,
     status_bar::StatusBar,
@@ -26,7 +26,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app_settings::{APP_NAME, APP_VERSION, WallpaperSource};
+use crate::app_settings::{APP_DISPLAY_NAME, APP_VERSION, WallpaperSource};
 use crate::downloader::DownloadManager;
 use crate::model::{
     AudioQuality, Container, DEFAULT_AUDIO, DEFAULT_AUDIO_CONTAINER, DEFAULT_CONTAINER,
@@ -65,7 +65,7 @@ pub struct AppView {
     add_quality: Entity<SelectState<Vec<&'static str>>>,
     add_audio: Entity<SelectState<Vec<&'static str>>>,
     add_container: Entity<SelectState<Vec<&'static str>>>,
-    add_destination: Entity<SelectState<Vec<SharedString>>>,
+    add_destination: Entity<SelectState<SearchableVec<SharedString>>>,
     running: bool,
     page: Page,
     wallpaper_source: Option<WallpaperSource>,
@@ -172,8 +172,15 @@ impl AppView {
             .iter()
             .map(SharedString::from)
             .collect();
-        let add_destination =
-            cx.new(|cx| SelectState::new(destination_labels, Some(IndexPath::new(0)), window, cx));
+        let add_destination = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(destination_labels),
+                Some(IndexPath::new(0)),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
 
         let running = queue.read(cx).active_item().is_some();
         let subscription = cx.subscribe(&queue, |this, _, _: &QueueEvent, cx| {
@@ -394,8 +401,15 @@ impl AppView {
             .iter()
             .map(SharedString::from)
             .collect();
-        self.add_destination =
-            cx.new(|cx| SelectState::new(destination_labels, Some(IndexPath::new(0)), window, cx));
+        self.add_destination = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(destination_labels),
+                Some(IndexPath::new(0)),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
         let model = self.queue.clone();
         let textarea = self.url_input.clone();
         let add_quality_select = self.add_quality.clone();
@@ -470,7 +484,14 @@ impl AppView {
                                                 .font_medium()
                                                 .child("ダウンロード先"),
                                         )
-                                        .child(Select::new(&add_destination_select).w_full()),
+                                        .child(
+                                            Select::new(&add_destination_select)
+                                                .w_full()
+                                                .icon(IconName::Search)
+                                                .search_placeholder("保存先を検索")
+                                                .highlight_matches(true)
+                                                .accessibility_label("ダウンロード先"),
+                                        ),
                                 ),
                         )
                         .child(
@@ -808,6 +829,7 @@ impl AppView {
             UpdateState::Available(_) => Some(
                 Button::new("install-app-update-about")
                     .primary()
+                    .flex_1()
                     .label("インストール")
                     .disabled(checking || installing)
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -816,6 +838,7 @@ impl AppView {
             ),
             UpdateState::Failed(_) => Some(
                 Button::new("retry-app-update-about")
+                    .flex_1()
                     .label("再実行")
                     .disabled(checking || installing)
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -828,6 +851,7 @@ impl AppView {
             LibraryUpdateState::Available(_) => Some(
                 Button::new("install-library-update-about")
                     .primary()
+                    .flex_1()
                     .label("インストール")
                     .disabled(checking || installing)
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -836,6 +860,7 @@ impl AppView {
             ),
             LibraryUpdateState::Failed(_) => Some(
                 Button::new("retry-library-update-about")
+                    .flex_1()
                     .label("再実行")
                     .disabled(checking || installing)
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -866,13 +891,7 @@ impl AppView {
                                         .h(px(80.))
                                         .object_fit(ObjectFit::Contain),
                                 )
-                                .child(div().text_xl().font_semibold().child(APP_NAME))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("yt-dlp GUI"),
-                                ),
+                                .child(div().text_xl().font_semibold().child(APP_DISPLAY_NAME)),
                         )
                         .child(Separator::horizontal())
                         .child(about_row("バージョン", APP_VERSION.to_string(), cx))
@@ -903,17 +922,23 @@ impl AppView {
                                 ),
                         )
                         .child(
-                            v_flex()
-                                .gap_2()
-                                .child(div().text_sm().font_medium().child("アプリ更新"))
+                            h_flex()
+                                .w_full()
+                                .items_start()
+                                .gap_4()
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(update_status),
-                                )
-                                .child(h_flex().gap_2().children(update_action))
-                                .children(match &update_state {
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_2()
+                                        .child(div().text_sm().font_medium().child("アプリ更新"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(update_status),
+                                        )
+                                        .children(match &update_state {
                                     UpdateState::Idle => None,
                                     UpdateState::Checking => Some(
                                         Alert::info(
@@ -965,19 +990,20 @@ impl AppView {
                                         .w_full(),
                                     ),
                                 }),
-                        )
-                        .child(
-                            v_flex()
-                                .gap_2()
-                                .child(div().text_sm().font_medium().child("ライブラリ更新"))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(library_status),
-                                )
-                                .child(h_flex().gap_2().children(library_update_action))
-                                .children(match &library_state {
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(div().text_sm().font_medium().child("ライブラリ更新"))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(library_status),
+                                    )
+                                    .children(match &library_state {
                                     LibraryUpdateState::Idle => None,
                                     LibraryUpdateState::Checking => Some(
                                         Alert::info(
@@ -1039,6 +1065,19 @@ impl AppView {
                                         .w_full(),
                                     ),
                                 }),
+                            )
+                        )
+                        .when(
+                            update_action.is_some() || library_update_action.is_some(),
+                            |this| {
+                                this.child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_2()
+                                        .children(update_action)
+                                        .children(library_update_action),
+                                )
+                            },
                         ),
                 ),
         )
@@ -1056,7 +1095,7 @@ impl AppView {
                         .small()
                         .text_color(cx.theme().primary),
                 )
-                .child(div().text_sm().font_semibold().child(APP_NAME))
+                .child(div().text_sm().font_semibold().child(APP_DISPLAY_NAME))
                 .child(div().flex_1())
                 .child(
                     div()
@@ -1104,7 +1143,7 @@ impl AppView {
             let color = cx.theme().muted_foreground;
             (
                 cx.theme().muted,
-                0.35,
+                0.12,
                 h_flex()
                     .items_center()
                     .gap_2()
@@ -1148,29 +1187,33 @@ impl AppView {
                         .text_right()
                         .text_sm()
                         .font_medium()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(cx.theme().foreground)
                         .child(format!("{percent:.0}%")),
                 );
             }
-            (color, 0.3, row.into_any_element())
+            (color, 0.12, row.into_any_element())
         } else if matches!(&state, UpdateState::Failed(_))
             || matches!(&library_state, LibraryUpdateState::Failed(_))
         {
             let color = cx.theme().danger;
             (
                 color,
-                0.3,
+                0.12,
                 h_flex()
                     .items_center()
                     .gap_2()
                     .child(Self::update_status_icon(IconName::CircleAlert, color))
                     .child(div().text_sm().font_medium().child("インストールに失敗"))
                     .child(
-                        Self::update_action_button("retry-update-title", "再実行", color, cx)
-                            .disabled(self.running)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.retry_update(window, cx);
-                            })),
+                        Self::update_action_button(
+                            "retry-update-title",
+                            "再実行",
+                            ButtonVariant::Danger,
+                        )
+                        .disabled(self.running)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.retry_update(window, cx);
+                        })),
                     )
                     .child(self.update_close_button(cx))
                     .into_any_element(),
@@ -1179,7 +1222,7 @@ impl AppView {
             let color = cx.theme().blue;
             (
                 color,
-                0.35,
+                0.12,
                 h_flex()
                     .items_center()
                     .gap_2()
@@ -1188,9 +1231,8 @@ impl AppView {
                     .child(
                         Self::update_action_button(
                             "update-area-install",
-                            "インストール…",
-                            color,
-                            cx,
+                            "インストール",
+                            ButtonVariant::Primary,
                         )
                         .disabled(self.running)
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1233,7 +1275,7 @@ impl AppView {
             .min_h_9()
             .rounded_full()
             .border_1()
-            .border_color(tint.opacity(0.18))
+            .border_color(tint.opacity(0.35))
             .bg(tint.opacity(opacity))
             .text_color(cx.theme().foreground)
             .shadow_sm()
@@ -1247,10 +1289,10 @@ impl AppView {
             .icon(IconName::Close)
             .custom(
                 ButtonCustomVariant::new(cx)
-                    .color(cx.theme().muted.opacity(0.4))
-                    .foreground(cx.theme().muted_foreground)
-                    .hover(cx.theme().muted.opacity(0.18))
-                    .active(cx.theme().muted.opacity(0.3)),
+                    .color(cx.theme().muted.opacity(0.6))
+                    .foreground(cx.theme().foreground)
+                    .hover(cx.theme().muted.opacity(0.25))
+                    .active(cx.theme().muted.opacity(0.4)),
             )
             .rounded_full()
             .p_0()
@@ -1263,36 +1305,26 @@ impl AppView {
     }
 
     fn update_status_icon(icon: IconName, color: Hsla) -> impl IntoElement {
-        div()
-            .size_6()
+        h_flex()
+            .size_7()
             .flex_shrink_0()
-            .items_center()
             .justify_center()
             .rounded_full()
             .bg(color.opacity(0.18))
-            .child(Icon::new(icon).small().text_color(color))
+            .child(Icon::new(icon).text_color(color))
     }
 
     fn update_action_button(
         id: &'static str,
         label: &'static str,
-        color: Hsla,
-        cx: &App,
+        variant: ButtonVariant,
     ) -> Button {
         Button::new(id)
             .small()
-            .custom(
-                ButtonCustomVariant::new(cx)
-                    .color(color)
-                    .foreground(color)
-                    .hover(color.opacity(0.35))
-                    .active(color.opacity(0.5)),
-            )
+            .with_variant(variant)
             .label(label)
             .font_semibold()
             .rounded_full()
-            .border_1()
-            .border_color(color.opacity(0.18))
             .shadow_none()
     }
 

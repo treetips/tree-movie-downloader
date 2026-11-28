@@ -3,6 +3,7 @@
 - ステータス: Accepted
 - 日付: 2026-11-28
 - 影響範囲: 更新・配布
+- 表示名の扱いは [ADR 0016](./0016-separate-app-display-name.md) で置換
 
 ## 背景
 

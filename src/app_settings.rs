@@ -11,6 +11,8 @@ use sys_locale::get_locale;
 
 pub const APP_DIR_NAME: &str = "tree-movie-downloader";
 pub const APP_NAME: &str = "TreeMovieDownloader";
+/// ツールバーとAbout画面で表示するアプリ名。
+pub const APP_DISPLAY_NAME: &str = "Tree Movie Downloader";
 
 /// ダウンロードファイル名の初期テンプレート。
 pub const DEFAULT_FILENAME_TEMPLATE: &str = "${uploadDate}_${title} [${duration}][${width}x${height} ${vcodec} ${fps} ${acodec} ${abr}][${id}].${ext}";
