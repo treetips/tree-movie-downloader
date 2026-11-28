@@ -81,7 +81,7 @@ impl ToolBootstrap {
         }
         self.started = true;
 
-        if self.paths.is_complete() {
+        if self.paths.is_complete() && !self.paths.has_legacy_tools() {
             self.phase = BootstrapPhase::Ready;
             cx.notify();
             return;

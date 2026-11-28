@@ -28,7 +28,9 @@
 
 - yt-dlp・ffmpeg（ffprobe を含む）・Deno はアプリ本体へ同梱せず、GitHub Releases から取得する。
 - 配布物は `tools-latest` タグの `tools-info.json` で管理し、実行中の OS と CPU に合う yt-dlp・ffmpeg・Deno の ZIP を選ぶ。
-- 取得した ZIP は SHA-256 を検証してから `~/.config/tree-movie-downloader/tools/` へ配置する。
+- 取得した ZIP は SHA-256 を検証してから `~/Library/Application Support/tree-movie-downloader/tools/` へ配置する。
+- 起動時に旧 `~/.config/tree-movie-downloader/tools/` が存在する場合は、新保存先へ移して旧保存先を削除する。別ボリュームへの移動が必要な場合はコピー後に削除する。新保存先が不完全な場合は旧ツールを統合し、完全な場合は新保存先を優先する。
+- 設定ファイル・壁紙・サウンドは、利用者が編集するファイルとして `~/.config/tree-movie-downloader/` 配下に保存する。
 - 起動時のツール準備では、管理下の yt-dlp・ffmpeg・ffprobe・Deno が実行可能なファイルとして存在するかを確認する。1つでも欠けていれば、更新対象だけを取得してツール準備画面を表示し、完了するまでメイン画面の操作をブロックする。すべて揃っていれば、この準備処理では通信せずメイン画面を表示する。
 - ツール準備と日常の更新確認は分離する。ツールがそろっている場合も、準備完了後にライブラリの更新を1回バックグラウンドで確認する。
 - ダウンロード中は受信バイト数と Content-Length から進捗率を求め、配置中は不確定表示にする。失敗時は理由と再試行ボタンを表示する。

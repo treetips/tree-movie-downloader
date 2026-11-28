@@ -143,7 +143,7 @@ yt-dlp・ffmpeg/ffprobe・Deno の状態・メッセージ・操作を表示し�
 #### 動的ラベル
 
 - 起動時に準備・更新した yt-dlp のバージョンを表示します。
-- バージョンはツールのインストール記録（`~/.config/tree-movie-downloader/tools/.installed.json`）から取得します。
+- バージョンはツールのインストール記録（`~/Library/Application Support/tree-movie-downloader/tools/.installed.json`）から取得します。
 - 未取得の場合は `未取得` と表示します。
 - アプリのバージョンとは独立して管理します。
 
