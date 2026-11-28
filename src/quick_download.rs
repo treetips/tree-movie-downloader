@@ -28,7 +28,7 @@ use crate::file_actions::{open_output_file, open_output_folder};
 use crate::model::{
     AudioQuality, Container, DEFAULT_AUDIO, DEFAULT_AUDIO_CONTAINER, DEFAULT_CONTAINER,
     DEFAULT_QUALITY, ItemStatus, Quality, QueueEvent, QueueItem, QueueModel, compact_url,
-    container_index, resolve_container,
+    resolve_container,
 };
 use crate::quick_url::{QuickUrlError, validate_quick_url};
 use crate::update_controller::UpdateController;
@@ -72,6 +72,9 @@ pub struct QuickDownloadView {
     quality: Entity<SelectState<Vec<&'static str>>>,
     audio: Entity<SelectState<Vec<&'static str>>>,
     container: Entity<SelectState<Vec<&'static str>>>,
+    default_quality: Quality,
+    default_audio: AudioQuality,
+    default_container: Container,
     details_open: bool,
     error_expanded: bool,
     job_id: Option<u64>,
@@ -106,10 +109,14 @@ impl QuickDownloadView {
             )
             .searchable(true)
         });
+        let (default_quality, default_audio) = {
+            let settings = queue.read(cx).settings();
+            (settings.quality(), settings.audio())
+        };
         let quality = cx.new(|cx| {
             SelectState::new(
                 Quality::ALL.map(Quality::label).to_vec(),
-                Some(IndexPath::new(DEFAULT_QUALITY.index())),
+                Some(IndexPath::new(default_quality.index())),
                 window,
                 cx,
             )
@@ -117,17 +124,25 @@ impl QuickDownloadView {
         let audio = cx.new(|cx| {
             SelectState::new(
                 AudioQuality::ALL.map(AudioQuality::label).to_vec(),
-                Some(IndexPath::new(DEFAULT_AUDIO.index())),
+                Some(IndexPath::new(default_audio.index())),
                 window,
                 cx,
             )
         });
         let settings_container = queue.read(cx).settings().container();
-        let selected_container_index =
-            container_index(&Container::VIDEO, settings_container, DEFAULT_CONTAINER);
+        let container_options = Container::options_for(default_quality);
+        let selected_container = resolve_container(default_quality, None, settings_container);
+        let selected_container_index = container_options
+            .iter()
+            .position(|container| *container == selected_container)
+            .unwrap_or(0);
+        let container_labels = container_options
+            .iter()
+            .map(|container| container.label())
+            .collect::<Vec<_>>();
         let container = cx.new(|cx| {
             SelectState::new(
-                Container::VIDEO.map(Container::label).to_vec(),
+                container_labels,
                 Some(IndexPath::new(selected_container_index)),
                 window,
                 cx,
@@ -161,6 +176,22 @@ impl QuickDownloadView {
                 this.sync_container(quality, window, cx);
             },
         );
+        let defaults_subscription = cx.subscribe_in(
+            &queue,
+            window,
+            |this, _, event: &QueueEvent, window, cx| match event {
+                QueueEvent::QualityDefaultChanged(quality) => {
+                    this.sync_quality_default(*quality, window, cx);
+                }
+                QueueEvent::AudioDefaultChanged(audio) => {
+                    this.sync_audio_default(*audio, window, cx);
+                }
+                QueueEvent::ContainerDefaultChanged(container) => {
+                    this.sync_container_default(*container, window, cx);
+                }
+                QueueEvent::Changed => {}
+            },
+        );
 
         Self {
             queue,
@@ -171,6 +202,9 @@ impl QuickDownloadView {
             quality,
             audio,
             container,
+            default_quality,
+            default_audio,
+            default_container: settings_container,
             details_open: false,
             error_expanded: false,
             job_id: None,
@@ -181,6 +215,7 @@ impl QuickDownloadView {
                 update_subscription,
                 input_subscription,
                 quality_subscription,
+                defaults_subscription,
             ],
         }
     }
@@ -404,8 +439,101 @@ impl QuickDownloadView {
         cx.notify();
     }
 
+    fn selected_quality(&self, cx: &Context<Self>) -> Quality {
+        self.quality
+            .read(cx)
+            .selected_value()
+            .copied()
+            .and_then(|label| {
+                Quality::ALL
+                    .iter()
+                    .copied()
+                    .find(|quality| quality.label() == label)
+            })
+            .unwrap_or(self.default_quality)
+    }
+
+    fn selected_audio(&self, cx: &Context<Self>) -> AudioQuality {
+        self.audio
+            .read(cx)
+            .selected_value()
+            .copied()
+            .and_then(|label| {
+                AudioQuality::ALL
+                    .iter()
+                    .copied()
+                    .find(|audio| audio.label() == label)
+            })
+            .unwrap_or(self.default_audio)
+    }
+
+    fn selected_container(&self, cx: &Context<Self>) -> Container {
+        let quality = self.selected_quality(cx);
+        self.container
+            .read(cx)
+            .selected_value()
+            .copied()
+            .and_then(|label| {
+                Container::ALL
+                    .iter()
+                    .copied()
+                    .find(|container| container.label() == label)
+            })
+            .unwrap_or_else(|| resolve_container(quality, None, self.default_container))
+    }
+
+    fn sync_quality_default(
+        &mut self,
+        quality: Quality,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let should_apply = self.selected_quality(cx) == self.default_quality;
+        self.default_quality = quality;
+        if should_apply {
+            self.quality.update(cx, |state, cx| {
+                state.set_selected_index(Some(IndexPath::new(quality.index())), window, cx);
+            });
+            self.sync_container(quality, window, cx);
+        }
+    }
+
+    fn sync_audio_default(
+        &mut self,
+        audio: AudioQuality,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let should_apply = self.selected_audio(cx) == self.default_audio;
+        self.default_audio = audio;
+        if should_apply {
+            self.audio.update(cx, |state, cx| {
+                state.set_selected_index(Some(IndexPath::new(audio.index())), window, cx);
+            });
+        }
+    }
+
+    fn sync_container_default(
+        &mut self,
+        container: Container,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let quality = self.selected_quality(cx);
+        let previous_default = resolve_container(quality, None, self.default_container);
+        let should_apply = self.selected_container(cx) == previous_default;
+        self.default_container = container;
+        if should_apply {
+            self.set_container_selection(
+                quality,
+                resolve_container(quality, None, container),
+                window,
+                cx,
+            );
+        }
+    }
+
     fn sync_container(&mut self, quality: Quality, window: &mut Window, cx: &mut Context<Self>) {
-        let options = Container::options_for(quality);
         let settings_container = self.queue.read(cx).settings().container();
         let current = self
             .container
@@ -418,7 +546,22 @@ impl QuickDownloadView {
                     .copied()
                     .find(|container| container.label() == label)
             });
-        let selected = resolve_container(quality, current, settings_container);
+        self.set_container_selection(
+            quality,
+            resolve_container(quality, current, settings_container),
+            window,
+            cx,
+        );
+    }
+
+    fn set_container_selection(
+        &mut self,
+        quality: Quality,
+        selected: Container,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let options = Container::options_for(quality);
         let selected = options
             .iter()
             .position(|container| *container == selected)

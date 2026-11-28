@@ -13,7 +13,7 @@ use gpui_kit::component::{
     hover_card::HoverCard,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     notification::Notification,
-    radio::RadioGroup,
+    radio::{Radio, RadioGroup},
     select::{Select, SelectEvent, SelectState},
     slider::{Slider, SliderEvent, SliderState},
     v_flex,
@@ -42,9 +42,20 @@ const FILENAME_VARIABLES: [(&str, &str); 11] = [
     ("ext", "ファイル拡張子"),
 ];
 use crate::model::{
-    Container, DownloadSettings, QueueModel, RETRY_CHOICES, RETRY_LABELS, default_downloads_dir,
+    AudioQuality, Container, DEFAULT_AUDIO_CONTAINER, DEFAULT_QUALITY, DownloadSettings, Quality,
+    QueueEvent, QueueModel, RETRY_CHOICES, RETRY_LABELS, default_downloads_dir,
 };
 use crate::wallpaper::{WallpaperState, wallpaper_image};
+
+const DOWNLOAD_QUALITY_CHOICES: [Quality; 4] = [
+    Quality::P1080,
+    Quality::P720,
+    Quality::P480,
+    Quality::AudioOnly,
+];
+const MP4_STRENGTH: &str = "汎用性が高く、多くの機器・アプリで再生しやすい形式です。";
+const MKV_STRENGTH: &str = "複数の映像・音声・字幕トラックを1つのファイルにまとめられるため、柔軟な収録・編集に向いています。";
+const WEBM_STRENGTH: &str = "軽量で、ブラウザでの再生やWeb配信に適しています。";
 
 /// 設定ページの状態。
 pub struct SettingsPage {
@@ -82,6 +93,12 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut settings = AppSettings::load();
+        if !DOWNLOAD_QUALITY_CHOICES
+            .iter()
+            .any(|choice| choice.index() == settings.quality_index)
+        {
+            settings.quality_index = DEFAULT_QUALITY.index();
+        }
         apply_theme(&settings, window, cx);
 
         let success_sounds = scan_sounds("success");
@@ -232,6 +249,8 @@ impl SettingsPage {
         );
         queue.update(cx, |model, _| {
             model.set_destinations(initial_destinations);
+            model.set_quality(Quality::from_index(settings.quality_index));
+            model.set_audio(AudioQuality::from_index(settings.audio_index));
             model.set_container(Container::from_index(settings.container_index));
             model.set_retries(settings.retries);
         });
@@ -582,6 +601,19 @@ impl SettingsPage {
         cx.notify();
     }
 
+    fn update_download_defaults(
+        &mut self,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut QueueModel),
+        event: QueueEvent,
+    ) {
+        self.queue.update(cx, |model, cx| {
+            update(model);
+            cx.emit(event);
+        });
+        cx.notify();
+    }
+
     fn save(&self, window: &mut Window, cx: &mut App) {
         if let Err(error) = self.settings.save() {
             window.push_notification(
@@ -709,6 +741,15 @@ impl SettingsPage {
 impl Render for SettingsPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = self.model_settings(cx);
+        let audio_container_labels = Container::AUDIO
+            .iter()
+            .map(|container| container.label())
+            .collect::<Vec<_>>()
+            .join("、");
+        let audio_container_note = format!(
+            "映像なしでは音声用コンテナ（{audio_container_labels}）を使います。初期値は{}です。",
+            DEFAULT_AUDIO_CONTAINER.label()
+        );
         let sound_enabled = self.settings.play_sound;
         let preview_color = self
             .settings
@@ -1236,31 +1277,135 @@ impl Render for SettingsPage {
                                                 filename_variables_table(cx),
                                                 None,
                                             ))
-                                            .child(setting_row(
-                                                "コンテナ",
+                                            .child(setting_row_top(
+                                                "ダウンロード初期値",
                                                 v_flex()
                                                     .w_full()
-                                                    .gap_1()
-                                                    .child(
-                                                        RadioGroup::horizontal("container")
-                                                            .children(Container::VIDEO.map(
-                                                                Container::label,
+                                                    .gap_2()
+                                                    .child(download_default_row(
+                                                        "画質",
+                                                        RadioGroup::horizontal("quality")
+                                                            .children(DOWNLOAD_QUALITY_CHOICES.map(
+                                                                |quality| {
+                                                                    download_default_radio(
+                                                                        quality.label(),
+                                                                        None,
+                                                                    )
+                                                                },
                                                             ))
                                                             .selected_index(Some(
-                                                                settings.container().index(),
+                                                                DOWNLOAD_QUALITY_CHOICES
+                                                                    .iter()
+                                                                    .position(|quality| {
+                                                                        *quality == settings.quality()
+                                                                    })
+                                                                    .unwrap_or(0),
                                                             ))
                                                             .on_change(cx.listener(
                                                                 |this, index, window, cx| {
-                                                                    let container =
-                                                                        Container::from_index(*index);
-                                                                    this.settings.container_index =
-                                                                        container.index();
-                                                                    this.update_queue(cx, |model| {
-                                                                        model.set_container(container);
-                                                                    });
+                                                                    let quality: Quality =
+                                                                        DOWNLOAD_QUALITY_CHOICES[*index];
+                                                                    this.settings.quality_index =
+                                                                        quality.index();
+                                                                    this.update_download_defaults(
+                                                                        cx,
+                                                                        |model| {
+                                                                            model.set_quality(quality);
+                                                                        },
+                                                                         QueueEvent::QualityDefaultChanged(quality),
+                                                                    );
                                                                     this.save(window, cx);
                                                                 },
                                                             )),
+                                                    ))
+                                                    .child(download_default_row(
+                                                        "音質",
+                                                        RadioGroup::horizontal("audio")
+                                                            .children(AudioQuality::ALL.map(|audio| {
+                                                                download_default_radio(
+                                                                    audio.label(),
+                                                                    None,
+                                                                )
+                                                            }))
+                                                            .selected_index(Some(
+                                                                settings.audio().index(),
+                                                            ))
+                                                            .on_change(cx.listener(
+                                                                |this, index, window, cx| {
+                                                                    let audio =
+                                                                        AudioQuality::from_index(*index);
+                                                                    this.settings.audio_index = audio.index();
+                                                                    this.update_download_defaults(
+                                                                        cx,
+                                                                        |model| {
+                                                                            model.set_audio(audio);
+                                                                        },
+                                                                         QueueEvent::AudioDefaultChanged(audio),
+                                                                    );
+                                                                    this.save(window, cx);
+                                                                },
+                                                            )),
+                                                    ))
+                                                    .child(download_default_row(
+                                                        "コンテナ",
+                                                        RadioGroup::horizontal("container")
+                                                            .disabled(
+                                                                settings.quality()
+                                                                    == Quality::AudioOnly,
+                                                            )
+                                                            .children(Container::VIDEO.map(
+                                                                |container| {
+                                                                    let strength = match container {
+                                                                        Container::Mp4 => MP4_STRENGTH,
+                                                                        Container::Mkv => MKV_STRENGTH,
+                                                                        Container::Webm => WEBM_STRENGTH,
+                                                                        _ => WEBM_STRENGTH,
+                                                                    };
+                                                                    download_default_radio(
+                                                                        container.label(),
+                                                                        Some(strength),
+                                                                    )
+                                                                },
+                                                            ))
+                                                            .selected_index(Some(
+                                                                Container::VIDEO
+                                                                    .iter()
+                                                                    .position(|container| {
+                                                                        *container == settings.container()
+                                                                    })
+                                                                    .unwrap_or(0),
+                                                            ))
+                                                            .on_change(cx.listener(
+                                                                |this, index, window, cx| {
+                                                                    let container: Container =
+                                                                        Container::VIDEO[*index];
+                                                                    this.settings.container_index =
+                                                                        container.index();
+                                                                    this.update_download_defaults(
+                                                                        cx,
+                                                                        |model| {
+                                                                            model.set_container(container);
+                                                                        },
+                                                                         QueueEvent::ContainerDefaultChanged(container),
+                                                                    );
+                                                                    this.save(window, cx);
+                                                                },
+                                                            )),
+                                                    ))
+                                                    .when(
+                                                        settings.quality() == Quality::AudioOnly,
+                                                        |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(
+                                                                        cx.theme().muted_foreground,
+                                                                    )
+                                                                    .child(
+                                                                        audio_container_note,
+                                                                    ),
+                                                            )
+                                                        },
                                                     )
                                                     .child(
                                                         div()
@@ -1269,7 +1414,7 @@ impl Render for SettingsPage {
                                                                 cx.theme().muted_foreground,
                                                             )
                                                             .child(
-                                                                "新しいURLの初期値です。追加後は各行から変更できます。映像なしを選んだ場合は、音声用コンテナ（m4a・mp3・opus・flac）から選びます。",
+                                                                "URLを追加する際の初期値を上記に設定します。",
                                                             ),
                                                     ),
                                                 None,
@@ -1437,6 +1582,31 @@ fn selected_sound_index(selected: Option<&str>, options: &[SoundOption]) -> Opti
 
 fn section_title(title: &'static str) -> Div {
     div().text_sm().font_semibold().child(title)
+}
+
+fn download_default_row(label: &'static str, radios: RadioGroup) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(80.)).flex_shrink_0().text_sm().child(label))
+        .child(radios)
+}
+
+fn download_default_radio(label: &'static str, strength: Option<&'static str>) -> Radio {
+    let radio = Radio::new(label).w(px(120.));
+
+    if let Some(strength) = strength {
+        radio.accessibility_label(label).tooltip(strength).child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(div().child(label))
+                .child(Icon::new(IconName::Info).xsmall()),
+        )
+    } else {
+        radio.label(label)
+    }
 }
 
 fn setting_row(
