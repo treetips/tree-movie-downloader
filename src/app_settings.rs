@@ -9,6 +9,8 @@ use gpui_kit::Hsla;
 use serde::{Deserialize, Serialize};
 use sys_locale::get_locale;
 
+use crate::model::{DEFAULT_AUDIO, DEFAULT_CONTAINER, DEFAULT_QUALITY};
+
 pub const APP_DIR_NAME: &str = "tree-movie-downloader";
 pub const APP_NAME: &str = "TreeMovieDownloader";
 /// ツールバーとAbout画面で表示するアプリ名。
@@ -335,6 +337,18 @@ fn bundle_resources_for(executable: &Path) -> Option<PathBuf> {
     Some(contents_dir.join("Resources"))
 }
 
+fn default_quality_index() -> usize {
+    DEFAULT_QUALITY.index()
+}
+
+fn default_audio_index() -> usize {
+    DEFAULT_AUDIO.index()
+}
+
+fn default_container_index() -> usize {
+    DEFAULT_CONTAINER.index()
+}
+
 /// 設定ファイル。存在しない、または壊れている場合は既定値を使う。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -355,6 +369,12 @@ pub struct AppSettings {
     pub background_color: Option<String>,
     pub filename_template: String,
     pub destinations: Vec<String>,
+    // 既存の設定ファイルとの互換性のため、選択肢は安定した配列インデックスで保存する。
+    #[serde(default = "default_quality_index")]
+    pub quality_index: usize,
+    #[serde(default = "default_audio_index")]
+    pub audio_index: usize,
+    #[serde(default = "default_container_index")]
     pub container_index: usize,
     pub retries: usize,
     pub cookies_from_browser: CookieBrowser,
@@ -379,7 +399,9 @@ impl Default for AppSettings {
             background_color: None,
             filename_template: DEFAULT_FILENAME_TEMPLATE.to_string(),
             destinations: Vec::new(),
-            container_index: 1,
+            quality_index: default_quality_index(),
+            audio_index: default_audio_index(),
+            container_index: default_container_index(),
             retries: 3,
             cookies_from_browser: CookieBrowser::None,
         }
@@ -633,6 +655,9 @@ mod tests {
             background_color: Some("#1E1E1E".into()),
             filename_template: "custom-${title}.${ext}".into(),
             destinations: vec!["/tmp/a".into(), "/tmp/b".into()],
+            quality_index: 2,
+            audio_index: 1,
+            container_index: 1,
             ..AppSettings::default()
         };
 
@@ -651,6 +676,48 @@ mod tests {
         assert_eq!(restored.background_color.as_deref(), Some("#1E1E1E"));
         assert_eq!(restored.filename_template, "custom-${title}.${ext}");
         assert_eq!(restored.destinations, vec!["/tmp/a", "/tmp/b"]);
+        assert_eq!(restored.quality_index, 2);
+        assert_eq!(restored.audio_index, 1);
+        assert_eq!(restored.container_index, 1);
+    }
+
+    #[test]
+    fn missing_download_defaults_keep_their_initial_values() {
+        let settings: AppSettings =
+            serde_json::from_str("{}").expect("deserialize settings without download defaults");
+
+        assert_eq!(settings.quality_index, default_quality_index());
+        assert_eq!(settings.audio_index, default_audio_index());
+        assert_eq!(settings.container_index, default_container_index());
+        assert_eq!(
+            crate::model::Quality::from_index(settings.quality_index),
+            DEFAULT_QUALITY
+        );
+        assert_eq!(
+            crate::model::AudioQuality::from_index(settings.audio_index),
+            DEFAULT_AUDIO
+        );
+        assert_eq!(
+            crate::model::Container::from_index(settings.container_index),
+            DEFAULT_CONTAINER
+        );
+    }
+
+    #[test]
+    fn partial_settings_keep_missing_download_defaults() {
+        let settings: AppSettings = serde_json::from_str(r#"{"container_index": 1}"#)
+            .expect("deserialize partial settings");
+
+        assert_eq!(settings.quality_index, default_quality_index());
+        assert_eq!(settings.audio_index, default_audio_index());
+        assert_eq!(settings.container_index, 1);
+    }
+
+    #[test]
+    fn download_default_indices_remain_stable() {
+        assert_eq!(crate::model::Quality::P1080.index(), 1);
+        assert_eq!(crate::model::AudioQuality::Best.index(), 0);
+        assert_eq!(crate::model::Container::Mp4.index(), 0);
     }
 
     #[cfg(target_os = "macos")]

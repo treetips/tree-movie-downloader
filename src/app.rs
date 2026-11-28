@@ -386,13 +386,17 @@ impl AppView {
         }
         self.url_input
             .update(cx, |state, cx| state.set_value("", window, cx));
+        let (quality, audio) = {
+            let settings = self.queue.read(cx).settings();
+            (settings.quality(), settings.audio())
+        };
         self.add_quality.update(cx, |state, cx| {
-            state.set_selected_index(Some(IndexPath::new(DEFAULT_QUALITY.index())), window, cx);
+            state.set_selected_index(Some(IndexPath::new(quality.index())), window, cx);
         });
         self.add_audio.update(cx, |state, cx| {
-            state.set_selected_index(Some(IndexPath::new(DEFAULT_AUDIO.index())), window, cx);
+            state.set_selected_index(Some(IndexPath::new(audio.index())), window, cx);
         });
-        self.sync_add_container(DEFAULT_QUALITY, true, window, cx);
+        self.sync_add_container(quality, true, window, cx);
 
         let destination_labels: Vec<SharedString> = self
             .queue
@@ -434,7 +438,7 @@ impl AppView {
 
             dialog
                 .title("URLを追加")
-                .width(px(560.))
+                .width(px(960.))
                 .centered()
                 .child(
                     v_flex()
@@ -443,7 +447,7 @@ impl AppView {
                             div()
                                 .text_sm()
                                 .font_medium()
-                                .child("動画・チャンネル・プレイリストのURL"),
+                                .child("URLを複数行入力すると一気にダウンロードキューに登録できます"),
                         )
                         .child(Textarea::new(&textarea).h(px(150.)))
                         .child(
@@ -452,6 +456,7 @@ impl AppView {
                                 .child(
                                     v_flex()
                                         .flex_1()
+                                        .min_w_0()
                                         .gap_1()
                                         .child(div().text_xs().font_medium().child("画質"))
                                         .child(Select::new(&add_quality_select).w_full()),
@@ -459,39 +464,38 @@ impl AppView {
                                 .child(
                                     v_flex()
                                         .flex_1()
+                                        .min_w_0()
                                         .gap_1()
                                         .child(div().text_xs().font_medium().child("音質"))
                                         .child(Select::new(&add_audio_select).w_full()),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .gap_1()
-                                        .child(div().text_xs().font_medium().child("コンテナ"))
-                                        .child(Select::new(&add_container_select).w_full()),
                                 )
                                 .child(
                                     v_flex()
                                         .flex_1()
+                                        .min_w_0()
                                         .gap_1()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_medium()
-                                                .child("ダウンロード先"),
-                                        )
-                                        .child(
-                                            Select::new(&add_destination_select)
-                                                .w_full()
-                                                .icon(IconName::Search)
-                                                .search_placeholder("保存先を検索")
-                                                .highlight_matches(true)
-                                                .accessibility_label("ダウンロード先"),
-                                        ),
+                                        .child(div().text_xs().font_medium().child("コンテナ"))
+                                        .child(Select::new(&add_container_select).w_full()),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .child("ダウンロード先"),
+                                )
+                                .child(
+                                    Select::new(&add_destination_select)
+                                        .w_full()
+                                        .icon(IconName::Search)
+                                        .search_placeholder("保存先を検索")
+                                        .highlight_matches(true)
+                                        .accessibility_label("ダウンロード先"),
                                 ),
                         )
                         .child(
@@ -814,13 +818,11 @@ impl AppView {
             tools::installed_version(tools::FFMPEG).unwrap_or_else(|| "未取得".to_string());
         let deno_version =
             tools::installed_version(tools::DENO).unwrap_or_else(|| "未取得".to_string());
-        let (update_state, library_state, update_status, library_status, checking, installing) = {
+        let (update_state, library_state, checking, installing) = {
             let controller = self.update_controller.read(cx);
             (
                 controller.state().clone(),
                 controller.library_state().clone(),
-                controller.status_text(),
-                controller.library_status_text(),
                 controller.is_checking() || controller.is_library_checking(),
                 controller.is_installing() || controller.is_library_installing(),
             )
@@ -944,12 +946,6 @@ impl AppView {
                                         .min_w_0()
                                         .gap_2()
                                         .child(div().text_sm().font_medium().child("アプリ更新"))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(update_status),
-                                        )
                                         .children(match &update_state {
                                     UpdateState::Idle => None,
                                     UpdateState::Checking => Some(
@@ -978,10 +974,7 @@ impl AppView {
                                     UpdateState::Available(info) => Some(
                                         Alert::warning(
                                             "about-app-update-alert",
-                                            format!(
-                                                "アプリを v{} にアップデートできます。",
-                                                info.version
-                                            ),
+                                            app_update_available_message(&info.version),
                                         )
                                         .w_full(),
                                     ),
@@ -995,7 +988,7 @@ impl AppView {
                                     UpdateState::Installed { .. } => Some(
                                         Alert::success(
                                             "about-app-update-alert",
-                                            "アプリの更新が完了しました。再起動すると適用されます。",
+                                            APP_UPDATE_COMPLETED_MESSAGE,
                                         )
                                         .w_full(),
                                     ),
@@ -1016,12 +1009,6 @@ impl AppView {
                                     .min_w_0()
                                     .gap_2()
                                     .child(div().text_sm().font_medium().child("ライブラリ更新"))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(library_status),
-                                    )
                                     .children(match &library_state {
                                     LibraryUpdateState::Idle => None,
                                     LibraryUpdateState::Checking => Some(
@@ -1595,7 +1582,6 @@ impl AppView {
     fn render_toolbar(&self, empty: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.running;
         let updating = self.is_updating(cx);
-        let can_add = Self::can_add_urls(running);
         let can_clear = Self::can_clear_queue(running, empty);
         let can_start =
             Self::can_start_queue(running, self.queue.read(cx).has_pending()) && !updating;
@@ -1607,21 +1593,7 @@ impl AppView {
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(
-                Button::new("add-urls")
-                    .icon(IconName::Plus)
-                    .label("URLを追加…")
-                    .tooltip(if running {
-                        "実行中はURLを追加できません"
-                    } else {
-                        "URLを追加（⌘N）"
-                    })
-                    .disabled(!can_add)
-                    .when(can_add, |this| this.secondary().large().font_semibold())
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_add_urls_dialog(window, cx)),
-                    ),
-            )
+            .child(Self::add_urls_button("add-urls", running, cx))
             .child(
                 Button::new("start-queue")
                     .icon(IconName::Play)
@@ -1653,6 +1625,25 @@ impl AppView {
             )
     }
 
+    fn add_urls_button(id: &'static str, running: bool, cx: &mut Context<Self>) -> Button {
+        let can_add = Self::can_add_urls(running);
+        let text_color = cx.theme().yellow;
+
+        Button::new(id)
+            .icon(IconName::Plus)
+            .label("URLを追加…")
+            .tooltip(if running {
+                "実行中はURLを追加できません"
+            } else {
+                "URLを追加（⌘N）"
+            })
+            .disabled(!can_add)
+            .when(can_add, |this| {
+                this.secondary().large().font_bold().text_color(text_color)
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.open_add_urls_dialog(window, cx)))
+    }
+
     fn render_queue(
         &self,
         total: usize,
@@ -1662,7 +1653,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let content: AnyElement = if total == 0 {
-            render_empty_queue(cx).into_any_element()
+            render_empty_queue(self.running, cx).into_any_element()
         } else {
             render_queue(
                 &self.queue,
@@ -1796,7 +1787,7 @@ impl AppView {
     }
 }
 
-fn render_empty_queue(cx: &mut Context<AppView>) -> impl IntoElement {
+fn render_empty_queue(running: bool, cx: &mut Context<AppView>) -> impl IntoElement {
     v_flex()
         .size_full()
         .items_center()
@@ -1809,18 +1800,7 @@ fn render_empty_queue(cx: &mut Context<AppView>) -> impl IntoElement {
                 .text_color(cx.theme().muted_foreground),
         )
         .child(div().text_sm().font_medium().child("キューは空です"))
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child("動画・チャンネル・プレイリストのURLを追加すると、ここに表示されます。"),
-        )
-        .child(
-            Button::new("empty-add-urls")
-                .icon(IconName::Plus)
-                .label("URLを追加")
-                .on_click(cx.listener(|this, _, window, cx| this.open_add_urls_dialog(window, cx))),
-        )
+        .child(AppView::add_urls_button("empty-add-urls", running, cx))
 }
 
 fn format_bytes(value: u64) -> String {
@@ -1836,6 +1816,13 @@ fn format_bytes(value: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+pub(crate) const APP_UPDATE_COMPLETED_MESSAGE: &str =
+    "アプリの更新が完了しました。再起動すると適用されます。";
+
+pub(crate) fn app_update_available_message(version: &str) -> String {
+    format!("アプリを v{version} にアップデートできます。")
 }
 
 fn about_row(label: &'static str, value: impl IntoElement, cx: &App) -> impl IntoElement {

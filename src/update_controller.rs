@@ -317,52 +317,6 @@ impl UpdateController {
         self.no_update_visible
     }
 
-    pub fn status_text(&self) -> String {
-        match &self.state {
-            UpdateState::Idle => "アプリを確認していません。".to_string(),
-            UpdateState::Checking => "アプリの更新を確認しています…".to_string(),
-            UpdateState::UpToDate => "アプリは最新です。".to_string(),
-            UpdateState::CheckFailed(message) => {
-                format!("アプリの更新を確認できませんでした。{message}")
-            }
-            UpdateState::Available(info) => {
-                format!("アプリを v{} にアップデートできます。", info.version)
-            }
-            UpdateState::Installing(phase) => format!("アプリをインストール中: {}", phase.label()),
-            UpdateState::Installed { .. } => {
-                "アプリの更新が完了しました。再起動すると適用されます。".to_string()
-            }
-            UpdateState::Failed(message) => {
-                format!("アプリのインストールに失敗しました。{message}")
-            }
-        }
-    }
-
-    pub fn library_status_text(&self) -> String {
-        match &self.library_state {
-            LibraryUpdateState::Idle => "ライブラリを確認していません。".to_string(),
-            LibraryUpdateState::Checking => "ライブラリの更新を確認しています…".to_string(),
-            LibraryUpdateState::UpToDate => "ライブラリは最新です。".to_string(),
-            LibraryUpdateState::CheckFailed(message) => {
-                format!("ライブラリの更新を確認できませんでした。{message}")
-            }
-            LibraryUpdateState::Available(entries) => format!(
-                "{} をアップデートできます。",
-                entries
-                    .iter()
-                    .map(|entry| entry.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join("、")
-            ),
-            LibraryUpdateState::Installing(phase) => {
-                format!("ライブラリをインストール中: {}", phase.label())
-            }
-            LibraryUpdateState::Failed(message) => {
-                format!("ライブラリのインストールに失敗しました。{message}")
-            }
-        }
-    }
-
     /// 起動時のアプリ更新確認。ダイアログは表示しない。
     pub fn check_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.state, UpdateState::Idle) {
@@ -1331,7 +1285,8 @@ mod tests {
         assert!(!controller.is_installing());
         assert!(!controller.has_app_update());
         assert_eq!(controller.install_plan(), InstallPlan::None);
-        assert!(controller.status_text().contains("再起動"));
+        assert_eq!(controller.state, installed_state());
+        assert!(crate::app::APP_UPDATE_COMPLETED_MESSAGE.contains("再起動"));
     }
 
     #[test]
@@ -1345,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn shows_the_available_version() {
+    fn keeps_the_available_version() {
         let controller = UpdateController {
             state: UpdateState::Available(info()),
             library_state: super::LibraryUpdateState::Idle,
@@ -1361,7 +1316,15 @@ mod tests {
             library_check_unavailable: false,
             dialog_plan: None,
         };
-        assert!(controller.status_text().contains("0.2.0"));
+        assert!(controller.has_app_update());
+        assert_eq!(
+            controller
+                .available
+                .as_ref()
+                .map(|info| info.version.as_str()),
+            Some("0.2.0")
+        );
+        assert!(crate::app::app_update_available_message("0.2.0").contains("0.2.0"));
     }
 
     #[test]

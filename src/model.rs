@@ -58,7 +58,7 @@ impl Quality {
     }
 
     pub fn from_index(index: usize) -> Self {
-        Self::ALL.get(index).copied().unwrap_or(Self::P1080)
+        Self::ALL.get(index).copied().unwrap_or(DEFAULT_QUALITY)
     }
 }
 
@@ -101,7 +101,7 @@ impl AudioQuality {
     }
 
     pub fn from_index(index: usize) -> Self {
-        Self::ALL.get(index).copied().unwrap_or(Self::Best)
+        Self::ALL.get(index).copied().unwrap_or(DEFAULT_AUDIO)
     }
 }
 
@@ -181,7 +181,7 @@ impl Container {
     }
 
     pub fn from_index(index: usize) -> Self {
-        Self::ALL.get(index).copied().unwrap_or(Self::Mkv)
+        Self::ALL.get(index).copied().unwrap_or(DEFAULT_CONTAINER)
     }
 }
 
@@ -190,7 +190,7 @@ pub const DEFAULT_QUALITY: Quality = Quality::P1080;
 /// URLを追加したときの音質の初期値。
 pub const DEFAULT_AUDIO: AudioQuality = AudioQuality::Best;
 /// 映像用コンテナの初期値。
-pub const DEFAULT_CONTAINER: Container = Container::Mkv;
+pub const DEFAULT_CONTAINER: Container = Container::Mp4;
 /// `映像なし` を選んだときの音声用コンテナの初期値。
 pub const DEFAULT_AUDIO_CONTAINER: Container = Container::M4a;
 
@@ -227,11 +227,13 @@ pub fn container_index(options: &[Container], selected: Container, fallback: Con
 pub const RETRY_CHOICES: [usize; 3] = [1, 3, 5];
 pub const RETRY_LABELS: [&str; 3] = ["1回", "3回", "5回"];
 
-/// キュー全体に適用するダウンロード設定。
+/// キュー全体に適用するダウンロード初期値。
 ///
-/// 画質と音質はURLごとに保持するため、ここには含めない。
+/// 画質・音質・コンテナはURLごとにも保持するが、ここには新規追加時の初期値を保持する。
 #[derive(Clone, Copy, Debug)]
 pub struct DownloadSettings {
+    quality: Quality,
+    audio: AudioQuality,
     container: Container,
     retries: usize,
 }
@@ -239,6 +241,8 @@ pub struct DownloadSettings {
 impl Default for DownloadSettings {
     fn default() -> Self {
         Self {
+            quality: DEFAULT_QUALITY,
+            audio: DEFAULT_AUDIO,
             container: DEFAULT_CONTAINER,
             retries: 3,
         }
@@ -246,6 +250,22 @@ impl Default for DownloadSettings {
 }
 
 impl DownloadSettings {
+    pub fn quality(&self) -> Quality {
+        self.quality
+    }
+
+    pub fn set_quality(&mut self, quality: Quality) {
+        self.quality = quality;
+    }
+
+    pub fn audio(&self) -> AudioQuality {
+        self.audio
+    }
+
+    pub fn set_audio(&mut self, audio: AudioQuality) {
+        self.audio = audio;
+    }
+
     pub fn container(&self) -> Container {
         self.container
     }
@@ -591,6 +611,9 @@ impl LogEntry {
 #[derive(Clone, Copy, Debug)]
 pub enum QueueEvent {
     Changed,
+    QualityDefaultChanged(Quality),
+    AudioDefaultChanged(AudioQuality),
+    ContainerDefaultChanged(Container),
 }
 
 const LOG_LIMIT: usize = 200;
@@ -878,6 +901,14 @@ impl QueueModel {
             }
         }
         self.destinations = normalized;
+    }
+
+    pub fn set_quality(&mut self, quality: Quality) {
+        self.settings.set_quality(quality);
+    }
+
+    pub fn set_audio(&mut self, audio: AudioQuality) {
+        self.settings.set_audio(audio);
     }
 
     pub fn set_container(&mut self, container: Container) {
@@ -2188,7 +2219,7 @@ mod tests {
         assert_eq!(model.items().first().unwrap().container(), Container::M4a);
 
         model.set_item_quality(id, Quality::P720);
-        assert_eq!(model.items().first().unwrap().container(), Container::Mkv);
+        assert_eq!(model.items().first().unwrap().container(), Container::Mp4);
 
         model.set_all_quality_for_site(Site::YouTube, Quality::AudioOnly);
         assert!(
