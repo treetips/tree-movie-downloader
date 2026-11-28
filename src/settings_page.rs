@@ -725,11 +725,13 @@ impl Render for SettingsPage {
                 div()
                     .id("settings-scroll")
                     .w_full()
-                    .max_w(px(820.))
+                    .min_w_0()
                     .h_full()
                     .overflow_y_scroll()
                     .child(
                         v_flex()
+                            .w_full()
+                            .min_w_0()
                             .gap_8()
                             .px_8()
                             .py_8()
@@ -1141,9 +1143,6 @@ impl Render for SettingsPage {
                                                     "背景画像は縦横比を維持するため、余白ができることがあります。その余白部分の色が背景色になります。",
                                                 )),
                                             ))
-                                            .footer(
-                                                "背景画像はコンテンツ領域に適用されます。ランダムを有効にすると、選択した時間ごとにユーザー背景画像を切り替えます。",
-                                            ),
                                     ),
                             )
                             .child(
@@ -1283,6 +1282,7 @@ impl Render for SettingsPage {
                                                     .child(
                                                         Textarea::new(&self.destination_input)
                                                             .aria_label("保存先フォルダ")
+                                                            .w_full()
                                                             .h(px(140.)),
                                                     )
                                                     .child(
@@ -1377,9 +1377,6 @@ impl Render for SettingsPage {
                                                     "ブラウザに保存されたCookieをyt-dlpへ渡します。macOSの権限により読み取れない場合は、環境変数 YT_DLP_COOKIES_FROM_BROWSER も利用できます。Safariはフルディスクアクセスが必要です。",
                                                 )),
                                             ))
-                                            .footer(
-                                                "YouTube API は使用しません。yt-dlp で処理します。",
-                                            ),
                                     ),
                             ),
                     ),

@@ -17,7 +17,7 @@ use gpui_kit::component::{
     notification::Notification,
     progress::Progress,
     scroll::ScrollableElement as _,
-    select::{Select, SelectEvent, SelectState},
+    select::{SearchableVec, Select, SelectEvent, SelectState},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -68,7 +68,7 @@ pub struct QuickDownloadView {
     downloads: Entity<DownloadManager>,
     updates: Entity<UpdateController>,
     url_input: Entity<InputState>,
-    destination: Entity<SelectState<Vec<SharedString>>>,
+    destination: Entity<SelectState<SearchableVec<SharedString>>>,
     quality: Entity<SelectState<Vec<&'static str>>>,
     audio: Entity<SelectState<Vec<&'static str>>>,
     container: Entity<SelectState<Vec<&'static str>>>,
@@ -97,8 +97,15 @@ impl QuickDownloadView {
             .iter()
             .map(SharedString::from)
             .collect();
-        let destination =
-            cx.new(|cx| SelectState::new(destination_labels, Some(IndexPath::new(0)), window, cx));
+        let destination = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(destination_labels),
+                Some(IndexPath::new(0)),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
         let quality = cx.new(|cx| {
             SelectState::new(
                 Quality::ALL.map(Quality::label).to_vec(),
@@ -198,7 +205,7 @@ impl QuickDownloadView {
             .and_then(|selected| labels.iter().position(|label| *label == selected))
             .unwrap_or(0);
         self.destination.update(cx, |state, cx| {
-            state.set_items(labels, window, cx);
+            state.set_items(SearchableVec::new(labels), window, cx);
             state.set_selected_index(Some(IndexPath::new(selected)), window, cx);
         });
     }
@@ -519,6 +526,9 @@ impl QuickDownloadView {
                                     .id("quick-destination")
                                     .accessibility_label("保存先")
                                     .w_full()
+                                    .icon(IconName::Search)
+                                    .search_placeholder("保存先を検索")
+                                    .highlight_matches(true)
                                     .disabled(settings_disabled),
                             ),
                     )
