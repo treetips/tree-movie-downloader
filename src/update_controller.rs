@@ -3,7 +3,7 @@
 //! 通信とファイル操作は [`crate::updater`] と [`crate::tools`] が担い、ここでは
 //! 2種類の更新を独立した状態として保持し、更新通知・About・確認ダイアログへ反映する。
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -16,7 +16,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 
 use crate::tools::{self, BootstrapEvent, ToolEntry, ToolPaths};
-use crate::updater::{self, InstallEvent, UpdateInfo};
+use crate::updater::{self, AppPlacement, InstallEvent, UpdateInfo};
 
 gpui_kit::actions!([InstallAvailableUpdates]);
 
@@ -73,6 +73,10 @@ pub enum UpdateState {
     CheckFailed(String),
     Available(UpdateInfo),
     Installing(InstallPhase),
+    Installed {
+        app: PathBuf,
+        rollback: AppPlacement,
+    },
     Failed(String),
 }
 
@@ -325,6 +329,9 @@ impl UpdateController {
                 format!("アプリを v{} にアップデートできます。", info.version)
             }
             UpdateState::Installing(phase) => format!("アプリをインストール中: {}", phase.label()),
+            UpdateState::Installed { .. } => {
+                "アプリの更新が完了しました。再起動すると適用されます。".to_string()
+            }
             UpdateState::Failed(message) => {
                 format!("アプリのインストールに失敗しました。{message}")
             }
@@ -390,6 +397,13 @@ impl UpdateController {
     /// メニュー・Aboutからの手動確認。アプリとライブラリの両方を確認する。
     pub fn check_manually(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_busy() || window.has_active_dialog(cx) {
+            return;
+        }
+        if matches!(self.state, UpdateState::Installed { .. }) {
+            window.push_notification(
+                Notification::info("アプリの更新が完了しています。再起動してください。"),
+                cx,
+            );
             return;
         }
 
@@ -641,9 +655,9 @@ impl UpdateController {
                 details.push(div().text_sm().child(format!("ライブラリ: {versions}")).into_any_element());
             }
             let description = if app_info.is_some() && !library_entries.is_empty() {
-                "ライブラリを更新した後、アプリを置き換えて再起動します。作業中のダウンロードは中断されます。"
+                "ライブラリを更新した後、アプリを置き換えます。完了後は任意のタイミングで再起動できます。作業中のダウンロードは中断されます。"
             } else if app_info.is_some() {
-                "ダウンロード後にアプリを置き換えて再起動します。作業中のダウンロードは中断されます。"
+                "ダウンロード後にアプリを置き換えます。完了後は任意のタイミングで再起動できます。作業中のダウンロードは中断されます。"
             } else {
                 "ライブラリを更新します。アプリの再起動は不要です。"
             };
@@ -923,6 +937,27 @@ impl UpdateController {
         cx.notify();
     }
 
+    /// 配置済みの新しいアプリを起動し、現在のプロセスを終了する。
+    pub fn relaunch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let UpdateState::Installed { app, rollback } = self.state.clone() else {
+            return;
+        };
+        if let Err(message) = updater::launch_app(&app) {
+            let message = match rollback.restore() {
+                Ok(()) => format!("{message}（旧アプリを復元しました）"),
+                Err(restore_error) => {
+                    format!("{message}（旧アプリの復元に失敗しました: {restore_error}）")
+                }
+            };
+            self.state = UpdateState::Failed(message.clone());
+            self.app_notification_dismissed = false;
+            self.open_error_dialog("再起動できませんでした", &message, window, cx);
+            cx.notify();
+        } else {
+            cx.quit();
+        }
+    }
+
     /// アプリ本体の失敗した更新をやり直す。
     pub fn retry_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_busy() || !matches!(self.state, UpdateState::Failed(_)) {
@@ -983,12 +1018,20 @@ impl UpdateController {
             // 失敗通知の下にアプリの更新通知を再表示しない。
             if matches!(
                 self.state,
-                UpdateState::Failed(_) | UpdateState::UpToDate | UpdateState::Available(_)
+                UpdateState::Failed(_)
+                    | UpdateState::UpToDate
+                    | UpdateState::Available(_)
+                    | UpdateState::Installed { .. }
             ) {
                 self.app_notification_dismissed = true;
             }
         } else if matches!(self.state, UpdateState::Failed(_)) {
             self.app_notification_dismissed = true;
+            changed = true;
+        } else if matches!(self.state, UpdateState::Installed { .. }) {
+            self.app_notification_dismissed = true;
+            self.no_update_visible = false;
+            self.cancel_hide();
             changed = true;
         } else if self.has_app_update() || self.has_library_update() {
             self.app_notification_dismissed = self.has_app_update();
@@ -1033,12 +1076,8 @@ impl UpdateController {
             InstallEvent::Placing => {
                 self.state = UpdateState::Installing(InstallPhase::Placing);
             }
-            InstallEvent::Installed { app: _ } => {
-                self.state = UpdateState::Idle;
-                self.available = None;
-                cx.notify();
-                cx.quit();
-                return;
+            InstallEvent::Installed { app, rollback } => {
+                self.state = UpdateState::Installed { app, rollback };
             }
             InstallEvent::Revealed { app } => {
                 self.state = UpdateState::Idle;
@@ -1080,6 +1119,8 @@ impl UpdateController {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
         InstallPhase, InstallPlan, LibraryInstallPhase, LibraryUpdateState, UpdateController,
         UpdateState,
@@ -1092,6 +1133,14 @@ mod tests {
             version: "0.2.0".to_string(),
             url: "https://example.com/app.zip".to_string(),
             sha256: "a".repeat(64),
+        }
+    }
+
+    fn installed_state() -> UpdateState {
+        let app = PathBuf::from("/Applications/TreeMovieDownloader.app");
+        UpdateState::Installed {
+            app: app.clone(),
+            rollback: crate::updater::AppPlacement::test_for_relaunch(app),
         }
     }
 
@@ -1202,6 +1251,18 @@ mod tests {
     }
 
     #[test]
+    fn dismissing_library_failure_also_dismisses_installed_app_notification() {
+        let mut controller = UpdateController::new();
+        controller.state = installed_state();
+        controller.library_state = LibraryUpdateState::Failed("offline".to_string());
+
+        assert!(controller.dismiss_notification_state());
+        assert!(!controller.is_app_update_notification_visible());
+        assert!(!controller.is_library_update_notification_visible());
+        assert!(matches!(controller.state, UpdateState::Installed { .. }));
+    }
+
+    #[test]
     fn dismissing_failure_does_not_reveal_a_stale_no_update_notification() {
         let mut controller = UpdateController::new();
         controller.state = UpdateState::UpToDate;
@@ -1259,6 +1320,28 @@ mod tests {
         assert!(!controller.is_installing());
         controller.state = UpdateState::Installing(InstallPhase::Verifying);
         assert!(controller.is_installing());
+    }
+
+    #[test]
+    fn installed_update_waits_for_relaunch() {
+        let mut controller = UpdateController::new();
+        controller.state = installed_state();
+
+        assert!(!controller.is_busy());
+        assert!(!controller.is_installing());
+        assert!(!controller.has_app_update());
+        assert_eq!(controller.install_plan(), InstallPlan::None);
+        assert!(controller.status_text().contains("再起動"));
+    }
+
+    #[test]
+    fn dismisses_installed_notification_without_losing_relaunch_state() {
+        let mut controller = UpdateController::new();
+        controller.state = installed_state();
+
+        assert!(controller.dismiss_notification_state());
+        assert!(!controller.is_app_update_notification_visible());
+        assert!(matches!(controller.state, UpdateState::Installed { .. }));
     }
 
     #[test]

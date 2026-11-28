@@ -3,6 +3,7 @@
 - ステータス: Accepted
 - 日付: 2026-11-26
 - 更新通知の表示と操作配置は [ADR 0010](./0010-rex-style-update-status-pill.md) で置換
+- アプリ更新後の再起動は [ADR 0020](./0020-user-initiated-app-relaunch.md) で置換
 
 ## 背景
 
