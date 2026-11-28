@@ -1,4 +1,4 @@
-//! yt-dlp・ffmpeg・Deno の配布バイナリを GitHub Releases から取得し、設定ディレクトリへ配置する。
+//! yt-dlp・ffmpeg・Deno の配布バイナリを GitHub Releases から取得し、アプリの管理領域へ配置する。
 //!
 //! アプリは外部ツールを同梱せず、起動時に不足しているバイナリをダウンロードする。
 //! 配布物の一覧は `tools-info.json` で管理し、取得した ZIP は SHA-256 で検証する。
@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "macos")]
 use crate::app_settings::config_dir;
+use crate::app_settings::tools_dir;
 
 /// 配布物の一覧を置く GitHub Releases の URL。
 ///
@@ -123,25 +125,75 @@ impl InstalledTools {
 #[derive(Clone, Debug)]
 pub struct ToolPaths {
     root: PathBuf,
+    legacy_root: Option<PathBuf>,
 }
 
 impl ToolPaths {
-    /// 設定ディレクトリ配下の既定の配置先。`TMD_TOOLS_DIR` があればそちらを使う。
+    /// 既定の配置先。`TMD_TOOLS_DIR` があればそちらを使う。
     pub fn from_env() -> Self {
-        let root = std::env::var_os(TOOLS_DIR_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config_dir().join("tools"));
-        Self { root }
+        let overridden = std::env::var_os(TOOLS_DIR_ENV).map(PathBuf::from);
+        let legacy_root = if overridden.is_none() {
+            legacy_tools_dir()
+        } else {
+            None
+        };
+        let root = overridden.unwrap_or_else(tools_dir);
+        Self { root, legacy_root }
     }
 
     /// 任意のディレクトリを使う配置先。テスト用。
     #[cfg(test)]
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            legacy_root: None,
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 旧保存先が残っていて、起動時の移行処理が必要かどうか。
+    pub(crate) fn has_legacy_tools(&self) -> bool {
+        self.legacy_root.as_ref().is_some_and(|path| path.exists())
+    }
+
+    fn migrate_legacy_tools(&self) -> Result<(), String> {
+        let Some(legacy) = self.legacy_root.as_deref() else {
+            return Ok(());
+        };
+        if legacy == self.root() || !legacy.exists() {
+            return Ok(());
+        }
+
+        if self.root.exists() {
+            if self.is_complete() {
+                fs::remove_dir_all(legacy)
+                    .map_err(|error| format!("旧ツール保存先を削除できません: {error}"))?;
+            } else {
+                copy_directory_contents(legacy, self.root(), false)
+                    .map_err(|error| format!("旧ツールを新しい保存先へ統合できません: {error}"))?;
+                fs::remove_dir_all(legacy)
+                    .map_err(|error| format!("旧ツール保存先を削除できません: {error}"))?;
+            }
+            return Ok(());
+        }
+
+        if let Some(parent) = self.root.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("ツールの保存先を作成できません: {error}"))?;
+        }
+        if let Err(error) = fs::rename(legacy, self.root()) {
+            copy_directory_contents(legacy, self.root(), true).map_err(|copy_error| {
+                format!(
+                    "旧ツールを新しい保存先へ移せません: {error}。コピーも失敗しました: {copy_error}"
+                )
+            })?;
+            fs::remove_dir_all(legacy)
+                .map_err(|error| format!("旧ツール保存先を削除できません: {error}"))?;
+        }
+        Ok(())
     }
 
     pub fn tool_dir(&self, name: &str) -> PathBuf {
@@ -226,6 +278,16 @@ impl ToolPaths {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn legacy_tools_dir() -> Option<PathBuf> {
+    Some(config_dir().join("tools"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn legacy_tools_dir() -> Option<PathBuf> {
+    None
+}
+
 /// 起動時の準備状況。UI はこのイベントだけを見て表示を切り替える。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootstrapEvent {
@@ -253,6 +315,10 @@ pub enum BootstrapEvent {
 
 /// 不足しているツールを取得する。呼び出し側は専用スレッドで実行する。
 pub fn bootstrap(paths: ToolPaths, events: smol::channel::Sender<BootstrapEvent>) {
+    if let Err(message) = paths.migrate_legacy_tools() {
+        let _ = events.send_blocking(BootstrapEvent::Failed(message));
+        return;
+    }
     if paths.is_complete() {
         let _ = events.send_blocking(BootstrapEvent::Ready);
         return;
@@ -760,6 +826,42 @@ fn set_executable(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn copy_directory_contents(source: &Path, destination: &Path, overwrite: bool) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            if destination_path.exists() && !destination_path.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} はディレクトリではありません",
+                        destination_path.display()
+                    ),
+                ));
+            }
+            copy_directory_contents(&source_path, &destination_path, overwrite)?;
+        } else if file_type.is_file() {
+            if !overwrite && destination_path.exists() {
+                continue;
+            }
+            let permissions = fs::metadata(&source_path)?.permissions();
+            fs::copy(&source_path, &destination_path)?;
+            fs::set_permissions(&destination_path, permissions)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} をコピーできません", source_path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn remove_path(path: &Path) {
     if path.is_dir() {
         let _ = fs::remove_dir_all(path);
@@ -1079,6 +1181,127 @@ mod tests {
 
     fn current_entry(name: &str) -> ToolEntry {
         entry(name, &Platform::current().unwrap().id(), true)
+    }
+
+    #[test]
+    fn migrates_legacy_tools_and_removes_the_old_directory() {
+        let root = temp_dir("migrate-legacy");
+        let legacy = root.join("legacy").join("tools");
+        let destination = root.join("application-support").join("tools");
+        let legacy_paths = ToolPaths::at(&legacy);
+        write_complete_tools(&legacy_paths);
+        record_versions(&legacy_paths, "1.0.0", "1.0.0", "1.0.0");
+        let paths = ToolPaths {
+            root: destination,
+            legacy_root: Some(legacy.clone()),
+        };
+
+        assert!(paths.has_legacy_tools());
+        paths.migrate_legacy_tools().unwrap();
+
+        assert!(!legacy.exists());
+        assert!(!paths.has_legacy_tools());
+        assert!(paths.is_complete());
+        assert_eq!(paths.installed_version(YT_DLP).as_deref(), Some("1.0.0"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bootstrap_uses_migrated_tools_without_downloading() {
+        let root = temp_dir("bootstrap-migrate");
+        let legacy = root.join("legacy").join("tools");
+        let destination = root.join("application-support").join("tools");
+        let legacy_paths = ToolPaths::at(&legacy);
+        write_complete_tools(&legacy_paths);
+        let paths = ToolPaths {
+            root: destination,
+            legacy_root: Some(legacy),
+        };
+        let (sender, receiver) = smol::channel::unbounded();
+
+        bootstrap(paths, sender);
+
+        assert_eq!(receiver.try_recv().unwrap(), BootstrapEvent::Ready);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn merges_legacy_tools_when_the_current_directory_is_incomplete() {
+        let root = temp_dir("migrate-existing-destination");
+        let legacy = root.join("legacy").join("tools");
+        let destination = root.join("application-support").join("tools");
+        write_executable(&destination.join("current"), b"current");
+        write_executable(&destination.join("shared"), b"new shared");
+        write_executable(&legacy.join("old"), b"old");
+        write_executable(&legacy.join("shared"), b"old shared");
+        let paths = ToolPaths {
+            root: destination.clone(),
+            legacy_root: Some(legacy.clone()),
+        };
+
+        paths.migrate_legacy_tools().unwrap();
+
+        assert_eq!(fs::read(destination.join("current")).unwrap(), b"current");
+        assert_eq!(fs::read(destination.join("old")).unwrap(), b"old");
+        assert_eq!(fs::read(destination.join("shared")).unwrap(), b"new shared");
+        assert!(!legacy.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removes_legacy_tools_when_the_current_directory_is_complete() {
+        let root = temp_dir("migrate-complete-destination");
+        let legacy = root.join("legacy").join("tools");
+        let destination = root.join("application-support").join("tools");
+        write_executable(&legacy.join("old-only"), b"old");
+        let paths = ToolPaths {
+            root: destination.clone(),
+            legacy_root: Some(legacy.clone()),
+        };
+        write_complete_tools(&paths);
+
+        paths.migrate_legacy_tools().unwrap();
+
+        assert!(paths.is_complete());
+        assert!(!destination.join("old-only").exists());
+        assert!(!legacy.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copies_directory_contents_and_preserves_execute_permission() {
+        let root = temp_dir("copy-directory");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        write_executable(&source.join("nested").join("tool"), b"tool");
+
+        copy_directory_contents(&source, &destination, true).unwrap();
+
+        assert!(is_executable_file(&destination.join("nested").join("tool")));
+        assert_eq!(
+            fs::read(destination.join("nested").join("tool")).unwrap(),
+            b"tool"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn leaves_legacy_tools_in_place_when_migration_fails() {
+        let root = temp_dir("migrate-failure");
+        let legacy = root.join("legacy").join("tools");
+        let blocked_parent = root.join("blocked");
+        fs::write(&blocked_parent, b"not a directory").unwrap();
+        write_executable(&legacy.join("yt-dlp"), b"legacy");
+        let paths = ToolPaths {
+            root: blocked_parent.join("tools"),
+            legacy_root: Some(legacy.clone()),
+        };
+
+        let error = paths.migrate_legacy_tools().unwrap_err();
+
+        assert!(error.contains("保存先"));
+        assert_eq!(fs::read(legacy.join("yt-dlp")).unwrap(), b"legacy");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

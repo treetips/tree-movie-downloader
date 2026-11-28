@@ -262,9 +262,29 @@ impl ShuffleInterval {
     }
 }
 
+/// ユーザーが編集する設定・サウンド・背景画像のディレクトリ。
 /// `~/.config/tree-movie-downloader`。
 pub fn config_dir() -> PathBuf {
     home_dir().join(".config").join(APP_DIR_NAME)
+}
+
+/// アプリが管理する外部ツールのディレクトリ。
+///
+/// macOSでは `~/Library/Application Support/tree-movie-downloader/tools`。
+/// それ以外のOSでは既存の設定ディレクトリ配下を使う。
+pub fn tools_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join(APP_DIR_NAME)
+            .join("tools")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        config_dir().join("tools")
+    }
 }
 
 fn home_dir() -> PathBuf {
@@ -629,6 +649,25 @@ mod tests {
         assert_eq!(restored.background_color.as_deref(), Some("#1E1E1E"));
         assert_eq!(restored.filename_template, "custom-${title}.${ext}");
         assert_eq!(restored.destinations, vec!["/tmp/a", "/tmp/b"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_tools_use_application_support_on_macos() {
+        let expected = home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join(APP_DIR_NAME)
+            .join("tools");
+
+        assert_eq!(tools_dir(), expected);
+        assert_eq!(config_dir(), home_dir().join(".config").join(APP_DIR_NAME));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn managed_tools_stay_in_the_config_directory_on_other_platforms() {
+        assert_eq!(tools_dir(), config_dir().join("tools"));
     }
 
     #[test]

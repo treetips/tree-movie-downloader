@@ -14,6 +14,8 @@
 
 yt-dlp・ffmpeg・Deno は初回起動時にアプリが GitHub Releases から取得します。利用者が別途インストールする必要はありません。
 
+macOSでは、取得したツールを `~/Library/Application Support/tree-movie-downloader/tools/` に配置します。設定・壁紙・サウンドは `~/.config/tree-movie-downloader/` 配下に保存します。
+
 ## 設定
 
 ### アプリケーション設定ファイル
