@@ -836,6 +836,18 @@ impl AppView {
                         this.open_app_update_dialog(window, cx);
                     })),
             ),
+            UpdateState::Installed { .. } => Some(
+                Button::new("relaunch-app-update-about")
+                    .success()
+                    .flex_1()
+                    .label("再起動")
+                    .disabled(self.running || checking || installing)
+                    .tooltip("ダウンロード中は再起動できません")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.update_controller
+                            .update(cx, |controller, cx| controller.relaunch(window, cx));
+                    })),
+            ),
             UpdateState::Failed(_) => Some(
                 Button::new("retry-app-update-about")
                     .flex_1()
@@ -977,6 +989,13 @@ impl AppView {
                                         Alert::info(
                                             "about-app-update-alert",
                                             format!("アプリをインストール中: {}", phase.label()),
+                                        )
+                                        .w_full(),
+                                    ),
+                                    UpdateState::Installed { .. } => Some(
+                                        Alert::success(
+                                            "about-app-update-alert",
+                                            "アプリの更新が完了しました。再起動すると適用されます。",
                                         )
                                         .w_full(),
                                     ),
@@ -1213,6 +1232,37 @@ impl AppView {
                         .disabled(self.running)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.retry_update(window, cx);
+                        })),
+                    )
+                    .child(self.update_close_button(cx))
+                    .into_any_element(),
+            )
+        } else if let UpdateState::Installed { .. } = &state {
+            let color = cx.theme().success;
+            (
+                color,
+                0.12,
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::update_status_icon(IconName::CircleCheck, color))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .child("アップデートが完了しました"),
+                    )
+                    .child(
+                        Self::update_action_button(
+                            "relaunch-update-title",
+                            "再起動",
+                            ButtonVariant::Success,
+                        )
+                        .disabled(self.running)
+                        .tooltip("ダウンロード中は再起動できません")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.update_controller
+                                .update(cx, |controller, cx| controller.relaunch(window, cx));
                         })),
                     )
                     .child(self.update_close_button(cx))

@@ -4,6 +4,7 @@
 - 日付: 2026-11-27
 - 更新通知の配置と余白は [ADR 0012](./0012-align-update-area-with-toolbar.md) で置換
 - 配色は [ADR 0018](./0018-update-notification-contrast.md) で置換
+- アプリ更新後の再起動は [ADR 0020](./0020-user-initiated-app-relaunch.md) で置換
 
 ## 背景
 

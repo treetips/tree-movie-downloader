@@ -64,12 +64,20 @@ impl Version {
 /// インストール処理の進捗。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallEvent {
-    Downloading { received: u64, total: Option<u64> },
+    Downloading {
+        received: u64,
+        total: Option<u64>,
+    },
     Verifying,
     Extracting,
     Placing,
-    Installed { app: PathBuf },
-    Revealed { app: PathBuf },
+    Installed {
+        app: PathBuf,
+        rollback: AppPlacement,
+    },
+    Revealed {
+        app: PathBuf,
+    },
     Failed(String),
 }
 
@@ -139,8 +147,9 @@ fn validate_info(info: &UpdateInfo) -> Result<(), String> {
 /// 更新ZIPをダウンロードし、検証・展開・配置まで行う。呼び出し側は専用スレッドで実行する。
 pub fn install_update(info: UpdateInfo, events: smol::channel::Sender<InstallEvent>) {
     match install_inner(&info, &events) {
-        Ok(InstallOutcome::Installed(app)) => {
-            let _ = events.send_blocking(InstallEvent::Installed { app });
+        Ok(InstallOutcome::Installed(rollback)) => {
+            let app = rollback.destination.clone();
+            let _ = events.send_blocking(InstallEvent::Installed { app, rollback });
         }
         Ok(InstallOutcome::Revealed(app)) => {
             let _ = events.send_blocking(InstallEvent::Revealed { app });
@@ -152,7 +161,7 @@ pub fn install_update(info: UpdateInfo, events: smol::channel::Sender<InstallEve
 }
 
 enum InstallOutcome {
-    Installed(PathBuf),
+    Installed(AppPlacement),
     Revealed(PathBuf),
 }
 
@@ -227,15 +236,7 @@ fn install_in_work_dir(
         Some(target) => {
             let _ = events.send_blocking(InstallEvent::Placing);
             let placement = place_app(target, &new_app)?;
-            if let Err(error) = launch_app(&placement.destination) {
-                return Err(match restore_placement(&placement) {
-                    Ok(()) => format!("{error}（旧アプリを復元しました）"),
-                    Err(restore_error) => {
-                        format!("{error}（旧アプリの復元に失敗しました: {restore_error}）")
-                    }
-                });
-            }
-            Ok(InstallOutcome::Installed(placement.destination))
+            Ok(InstallOutcome::Installed(placement))
         }
         None => Ok(InstallOutcome::Revealed(new_app)),
     }
@@ -467,11 +468,29 @@ fn cleanup_app_backups_in(parent: &Path, now: u128) {
     }
 }
 
-struct AppPlacement {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppPlacement {
     target: PathBuf,
     destination: PathBuf,
     target_backup: Option<PathBuf>,
     destination_backup: Option<PathBuf>,
+}
+
+impl AppPlacement {
+    /// 配置前の状態へ戻す。
+    pub fn restore(&self) -> Result<(), String> {
+        restore_placement(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_for_relaunch(destination: PathBuf) -> Self {
+        Self {
+            target: destination.clone(),
+            destination,
+            target_backup: None,
+            destination_backup: None,
+        }
+    }
 }
 
 fn place_app(target: &Path, new_app: &Path) -> Result<AppPlacement, String> {
@@ -578,7 +597,8 @@ fn replace_app(target: &Path, new_app: &Path) -> Result<PathBuf, String> {
     Ok(backup)
 }
 
-fn launch_app(app: &Path) -> Result<(), String> {
+/// 配置済みのアプリを新しいプロセスで起動する。
+pub fn launch_app(app: &Path) -> Result<(), String> {
     let status = Command::new("/usr/bin/open")
         .arg("-n")
         .arg(app)
